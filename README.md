@@ -81,6 +81,18 @@ AWS_SECRET_ACCESS_KEY=test
 pip install -r requirements.txt
 ```
 
+### 2-1. (선택) Postgres pgvector 설정
+
+`products` 테이블에 벡터 컬럼(`embedding vector(1536)`)과 인덱스를 추가하려면 아래 SQL을 실행하세요.
+
+- 파일: `sql/pgvector_setup.sql`
+
+예시(로컬):
+
+```bash
+psql -h localhost -p 5432 -U postgres -d snowman -f sql/pgvector_setup.sql
+```
+
 ### 3. 서버 실행
 
 ```bash

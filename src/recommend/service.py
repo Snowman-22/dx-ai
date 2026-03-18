@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,13 +62,13 @@ async def _get_or_create_chat(
     session: AsyncSession,
     *,
     chat_session_id: str,
-    chat_title: str | None = None,
+    chat_title: Optional[str] = None,
 ) -> Chat:
     """
     conv_id(chat_session_id) 기준으로 Chat row를 조회하거나 생성.
     """
     result = await session.execute(select(Chat).where(Chat.conv_id == chat_session_id))
-    chat: Chat | None = result.scalar_one_or_none()
+    chat: Optional[Chat] = result.scalar_one_or_none()
 
     from datetime import datetime, timezone
 
@@ -102,7 +102,7 @@ async def save_recommendations_to_db(
     *,
     chat_session_id: str,
     recommendation_list: Sequence[dict[str, Any]],
-    chat_title: str | None = None,
+    chat_title: Optional[str] = None,
 ) -> None:
     """
     LangGraph에서 생성한 recommendation_list를 Postgres Chat/Recommendation 테이블에 저장.
@@ -129,7 +129,7 @@ async def save_recommendations_to_db(
                 name = str(item.get("name") or "") or None
 
                 # 현재 스키마상 products가 배열이므로, 단일 추천도 1개짜리 배열로 저장
-                products: list[str] | None = None
+                products: Optional[list[str]] = None
                 if name:
                     products = [name]
 
@@ -144,7 +144,7 @@ async def save_recommendations_to_db(
 async def ensure_chat_metadata(
     *,
     chat_session_id: str,
-    chat_title: str | None = None,
+    chat_title: Optional[str] = None,
 ) -> None:
     """
     추천이 아직 생성되지 않은 단계에서도 Chat row를 만들어 두기 위한 헬퍼.

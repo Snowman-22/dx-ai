@@ -1,12 +1,12 @@
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from .settings import get_database_url
 
 
-_engine: AsyncEngine | None = None
-_session_maker: async_sessionmaker[AsyncSession] | None = None
+_engine: Optional[AsyncEngine] = None
+_session_maker: Optional[async_sessionmaker[AsyncSession]] = None
 
 
 def get_engine() -> AsyncEngine:

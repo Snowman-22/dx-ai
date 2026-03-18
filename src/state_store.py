@@ -14,7 +14,12 @@ from langgraph.checkpoint.memory import MemorySaver
 def get_checkpointer() -> BaseCheckpointSaver:
     table_name = os.getenv("DYNAMODB_TABLE_NAME", "").strip()
     if table_name:
-        return _get_dynamodb_checkpointer(table_name)
+        try:
+            return _get_dynamodb_checkpointer(table_name)
+        except Exception:
+            # DynamoDB 설정/자격증명/리전 문제로 초기화가 실패하면
+            # 개발/로컬 실행이 막히지 않도록 메모리 체크포인터로 폴백합니다.
+            return _get_memory_checkpointer()
     return _get_memory_checkpointer()
 
 
