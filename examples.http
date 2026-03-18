@@ -1,0 +1,25 @@
+### 헬스 체크
+GET http://localhost:8000/health
+
+### CHAT-1 예산 입력 예시
+POST http://localhost:8000/ai/chat
+Content-Type: application/json
+
+{
+  "conv_id": "chat_T6bC9dE2fG5hJ",
+  "question_text": "가장 중요한 총 예산을 알려주세요 💸...",
+  "assistant_text": "가장 중요한 총 예산을 알려주세요 💸...",
+  "user_text": "200"
+}
+
+### CHAT-2 평수 입력 예시
+POST http://localhost:8000/ai/chat
+Content-Type: application/json
+
+{
+  "conv_id": "chat_T6bC9dE2fG5hJ",
+  "question_text": "지금 살고 계신 집의 평수는 어떻게 되나요?",
+  "assistant_text": "지금 살고 계신 집의 평수는 어떻게 되나요?",
+  "user_text": "10~20평"
+}
+
