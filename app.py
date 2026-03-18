@@ -18,36 +18,17 @@ from src.recommend.service import ensure_chat_metadata, save_recommendations_to_
 class ChatRequest(BaseModel):
     # 하나의 conv_id(문자열)로 채팅 세션을 식별
     conv_id: str
+    # 프론트/스프링이 "현재 단계"를 들고 있고, FastAPI는 그 단계에 맞는 노드를 실행
+    # (기존에는 FastAPI가 step_code를 응답으로 내려주며 다음 단계를 주도)
+    step_code: str
     # SpringBoot/프론트가 화면에 표시한 assistant 문구를 그대로 저장하고 싶을 때 전달
     assistant_text: Optional[object] = None
     user_text: Optional[object] = None
 
 
 class ChatResponse(BaseModel):
-    chat_type: str
-    step_code: str
     data: dict
-    is_completed: bool
     ai_response: Optional[str] = None
-
-
-def _chat_type_from_step(step_code: str) -> str:
-    # CHAT_0~CHAT_6: 사용자정보 파악 채팅
-    if step_code in {
-        "CHAT_0",
-        "CHAT_1",
-        "CHAT_2",
-        "CHAT_3",
-        "CHAT_3_1",
-        "CHAT_4",
-        "CHAT_5",
-        "CHAT_6",
-    }:
-        return "USER_INFO_CHAT"
-    # CHAT_RESULT~RAG_CHAT: 패키지 추천/추천 이후 대화
-    if step_code in {"CHAT_RESULT", "RAG_CHAT"}:
-        return "PACKAGE_RECO_CHAT"
-    return "UNKNOWN"
 
 
 def create_app() -> FastAPI:
@@ -74,6 +55,8 @@ def create_app() -> FastAPI:
     async def chat_endpoint(payload: ChatRequest):
         if not payload.conv_id:
             raise HTTPException(status_code=400, detail="conv_id is required")
+        if not payload.step_code:
+            raise HTTPException(status_code=400, detail="step_code is required")
 
         # LangGraph state 초기화 / 복구
         # conv_id를 그대로 LangGraph thread_id로 사용하고,
@@ -83,7 +66,11 @@ def create_app() -> FastAPI:
         # 입력을 LangGraph용 상태로 변환
         # 중요: checkpointer(DynamoDB/메모리)가 이전 state(user_info 등)를 복구하므로,
         # 여기서 빈 dict로 덮어쓰지 않도록 "이번 턴에 새로 들어온 정보"만 전달합니다.
+        #
+        # step_code는 "프론트/스프링이 가진 현재 단계"이며, FastAPI는 이를 기준으로 라우팅합니다.
+        # (checkpoint에 저장된 step이 있더라도, 요청으로 들어온 step_code를 우선합니다.)
         state: ChatState = {
+            "step": ChatStep(payload.step_code),
             "incoming_assistant_message": payload.assistant_text,
             "last_user_input": payload.user_text,
         }
@@ -91,7 +78,7 @@ def create_app() -> FastAPI:
 
         # 어떤 단계에서 끊기더라도 Postgres Chat 메타데이터는 남도록 conv_id로 upsert
         try:
-            await ensure_chat_metadata(chat_session_id=payload.conv_id)
+            await ensure_chat_metadata(conv_id=payload.conv_id)
         except Exception:
             # 메타데이터 저장 실패는 챗 응답에는 영향 없도록 무시
             import logging
@@ -135,7 +122,7 @@ def create_app() -> FastAPI:
 
             try:
                 await save_recommendations_to_db(
-                    chat_session_id=payload.conv_id,
+                    conv_id=payload.conv_id,
                     recommendation_list=recommendation_list,
                     chat_title=chat_title,
                 )
@@ -148,13 +135,25 @@ def create_app() -> FastAPI:
                     "Failed to save recommendations to DB: %s", e
                 )
 
-        return ChatResponse(
-            chat_type=_chat_type_from_step(str(result["step"])),
-            step_code=result["step"],
-            data=result.get("data", {}),
-            is_completed=result.get("is_completed", False),
-            ai_response=result.get("ai_response"),
-        )
+        data = result.get("data", {}) or {}
+        ai_response = result.get("ai_response")
+
+        # CHAT_0~CHAT_6 구간은 일반적으로 data가 비어있으므로,
+        # 프론트/스프링에서 성공 여부를 단순하게 처리할 수 있도록 message를 내려준다.
+        if payload.step_code in {
+            "CHAT_0",
+            "CHAT_1",
+            "CHAT_2",
+            "CHAT_3",
+            "CHAT_3_1",
+            "CHAT_4",
+            "CHAT_5",
+            "CHAT_6",
+        }:
+            if isinstance(data, dict) and "error" not in data:
+                data = {"message": "성공적으로 저장되었습니다."}
+
+        return ChatResponse(data=data, ai_response=ai_response)
 
     @app.get("/health")
     async def health():

@@ -61,13 +61,13 @@ async def generate_recommendation_result(*, user_info: dict[str, Any]) -> Recomm
 async def _get_or_create_chat(
     session: AsyncSession,
     *,
-    chat_session_id: str,
+    conv_id: str,
     chat_title: Optional[str] = None,
 ) -> Chat:
     """
-    conv_id(chat_session_id) 기준으로 Chat row를 조회하거나 생성.
+    conv_id 기준으로 Chat row를 조회하거나 생성.
     """
-    result = await session.execute(select(Chat).where(Chat.conv_id == chat_session_id))
+    result = await session.execute(select(Chat).where(Chat.conv_id == conv_id))
     chat: Optional[Chat] = result.scalar_one_or_none()
 
     from datetime import datetime, timezone
@@ -88,7 +88,7 @@ async def _get_or_create_chat(
         chat_title = f"가전/가구 추천 {now.strftime('%Y-%m-%d %H:%M')}"
 
     chat = Chat(
-        conv_id=chat_session_id,
+        conv_id=conv_id,
         chat_title=chat_title,
         start_date=now,
         end_date=now,
@@ -100,14 +100,14 @@ async def _get_or_create_chat(
 
 async def save_recommendations_to_db(
     *,
-    chat_session_id: str,
+    conv_id: str,
     recommendation_list: Sequence[dict[str, Any]],
     chat_title: Optional[str] = None,
 ) -> None:
     """
     LangGraph에서 생성한 recommendation_list를 Postgres Chat/Recommendation 테이블에 저장.
 
-    - chat_session_id: 프론트/체크포인터에서 사용하는 conv_id
+    - conv_id: 프론트/체크포인터에서 사용하는 conv_id (LangGraph thread_id와 동일)
     - recommendation_list: graph.node_chat_result에서 내려오는 리스트
       각 원소 예시:
       {"category": "...", "name": "...", "reason": "...", "estimated_price": ...}
@@ -120,7 +120,7 @@ async def save_recommendations_to_db(
         async with session.begin():
             chat = await _get_or_create_chat(
                 session,
-                chat_session_id=chat_session_id,
+                conv_id=conv_id,
                 chat_title=chat_title,
             )
 
@@ -143,7 +143,7 @@ async def save_recommendations_to_db(
 
 async def ensure_chat_metadata(
     *,
-    chat_session_id: str,
+    conv_id: str,
     chat_title: Optional[str] = None,
 ) -> None:
     """
@@ -156,7 +156,7 @@ async def ensure_chat_metadata(
         async with session.begin():
             await _get_or_create_chat(
                 session,
-                chat_session_id=chat_session_id,
+                conv_id=conv_id,
                 chat_title=chat_title,
             )
 

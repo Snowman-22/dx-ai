@@ -8,7 +8,7 @@
 
 **저장소 역할**  
 - **Spring Boot + PostgreSQL**: `Chat` 테이블 등으로 구조화된 메타데이터(chat_id, guest_session_id, start_date 등) 관리.  
-- **DynamoDB**: 한 대화(채팅방)의 모든 채팅 내용·상태를 **`chat_session_id`**(LangGraph `thread_id`) 기준으로 저장해 같은 대화 흐름을 이어갑니다.
+- **DynamoDB**: 한 대화(채팅방)의 모든 채팅 내용·상태를 **`conv_id`**(LangGraph `thread_id`) 기준으로 저장해 같은 대화 흐름을 이어갑니다.
 
 ### 1. 환경 변수
 
@@ -46,7 +46,7 @@ AWS 인증은 아래 중 하나로 설정합니다.
 
 | 항목 | 설명 |
 |------|------|
-| **Partition Key (PK)** | `thread_id` → 우리는 `chat_session_id`를 그대로 사용 (예: `chat_T6bC9dE2fG5hJ`) |
+| **Partition Key (PK)** | `thread_id` → 우리는 `conv_id`를 그대로 사용 (예: `chat_T6bC9dE2fG5hJ`) |
 | **Sort Key (SK)** | `checkpoint_id` → 요청/노드 실행 시점마다 생성되는 고유 ID (예: UUID) |
 | **저장 내용** | 해당 시점의 **그래프 상태 스냅샷** (LangGraph가 직렬화한 체크포인트) |
 
@@ -57,7 +57,7 @@ AWS 인증은 아래 중 하나로 설정합니다.
 - `messages`: 대화 메시지 목록 (현재는 미사용)
 - 그 외 LangGraph가 사용하는 메타데이터(버전, 체크포인트 네임스페이스 등)
 
-즉, **같은 `chat_session_id`(thread_id)로 여러 번 요청**이 오면, 이전에 저장된 `user_info`·`step`을 복구해서 다음 단계를 이어가고, 실행 후 새 스냅샷을 다시 DynamoDB에 적재합니다.  
+즉, **같은 `conv_id`(thread_id)로 여러 번 요청**이 오면, 이전에 저장된 `user_info`·`step`을 복구해서 다음 단계를 이어가고, 실행 후 새 스냅샷을 다시 DynamoDB에 적재합니다.  
 대화 문구(`question_text`·`user_text`) 이력 저장은 Spring Boot가 MongoDB 등에 하는 것이고, FastAPI/DynamoDB에는 **세션 상태(체크포인트)** 만 저장됩니다.
 
 **로컬 DynamoDB** (Localstack, DynamoDB Local) 사용 시:
@@ -112,10 +112,10 @@ uvicorn app:app --reload
 
 ```json
 {
-  "chat_session_id": "chat_T6bC9dE2fG5hJ",
-  "current_step": "CHAT_1",
-  "question_text": "프론트에서 보여준 질문 문구",
-  "user_text": "사용자 입력 (string 또는 string[])"
+  "conv_id": "chat_T6bC9dE2fG5hJ",
+  "step_code": "CHAT_1",
+  "assistant_text": "프론트/스프링이 화면에 표시한 assistant 문구(선택)",
+  "user_text": "사용자 입력 (string | string[] | object)"
 }
 ```
 
@@ -123,15 +123,13 @@ uvicorn app:app --reload
 
 ```json
 {
-  "chat_type": "USER_INFO_CHAT",
-  "step_code": "CHAT_2",
   "data": {},
-  "is_completed": false,
   "ai_response": null
 }
 ```
 
-`step_code`는 다음 단계(CHAT_1~CHAT_RESULT, RAG_CHAT)를 의미하며, 프론트/스프링에서 이 값을 기준으로 고정 메시지를 매핑합니다.
+`step_code`는 **프론트 → Spring Boot → FastAPI**로 전달되는 "현재 단계"입니다.  
+FastAPI는 해당 단계에 맞는 노드를 실행하고, 세션 상태는 `conv_id`(LangGraph `thread_id`) 기준으로 체크포인트에 저장/복구됩니다.
 
 `chat_type`은 채팅 유형 구분용입니다.
 

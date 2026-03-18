@@ -46,7 +46,7 @@ class Product(Base):
 class Chat(Base):
     """
     진단/추천 세션 메타데이터.
-    DynamoDB의 conv_id(chat_session_id)와 Postgres를 연결하는 용도.
+    DynamoDB의 conv_id(LangGraph thread_id)와 Postgres를 연결하는 용도.
     """
 
     __tablename__ = "chat"
