@@ -43,6 +43,64 @@ class Product(Base):
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(1536), nullable=True)
 
 
+# --- RDS 스키마 기반 상세 조회용 모델들 ---
+# NOTE: 실제 스키마가 아래 테이블/컬럼명과 다르면 조정이 필요합니다.
+
+
+class ProductEntity(Base):
+    """
+    RDS의 product 테이블(이미지 스키마 기준) 매핑.
+    RAG 단계에서 패키지 상세설명용으로 사용.
+    """
+
+    __tablename__ = "product"
+
+    product_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    model_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    category: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    product_category: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    brand: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    original_price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    discount_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    discount_price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_subscribe: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    review_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    review_cnt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    product_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    product_image_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+
+
+class ProductSpecEntity(Base):
+    __tablename__ = "product_spec"
+
+    product_spec_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    width: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    height: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    depth: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    weight: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+
+class SubscribePriceEntity(Base):
+    __tablename__ = "subscribe_price"
+
+    subscribe_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    contract_period_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    mandatory_period_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    visit_service_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    visit_cycle_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
 class Chat(Base):
     """
     진단/추천 세션 메타데이터.

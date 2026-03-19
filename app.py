@@ -11,8 +11,6 @@ from pydantic import BaseModel
 
 from src.graph import chat_app, ChatState, ChatStep
 from src.state_store import get_checkpointer
-from src.db import get_engine
-from src.recommend.service import ensure_chat_metadata, save_recommendations_to_db
 
 from sqlalchemy import text
 from src.db import get_engine  # 이미 있다면 패스!
@@ -46,14 +44,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    checkpointer = get_checkpointer()
-
-    @app.on_event("startup")
-    async def _startup():
-        # DB 커넥션이 유효한지 빠르게 확인(실패 시 로그로 확인 가능)
-        engine = get_engine()
-        async with engine.begin() as conn:
-            await conn.run_sync(lambda _: None)
+    # checkpointer는 graph.compile 시 사용되므로 여기서는 생성만 보장(사이드이펙트 없음)
+    _ = get_checkpointer()
 
     @app.post("/ai/chat", response_model=ChatResponse)
     async def chat_endpoint(payload: ChatRequest):
@@ -81,70 +73,6 @@ def create_app() -> FastAPI:
             "last_user_input": payload.user_text,
         }
         result = await chat_app.ainvoke(state, config=config)
-
-        # 어떤 단계에서 끊기더라도 Postgres Chat 메타데이터는 남도록 conv_id로 upsert
-        try:
-            await ensure_chat_metadata(conv_id=payload.conv_id)
-        except Exception:
-            # 메타데이터 저장 실패는 챗 응답에는 영향 없도록 무시
-            import logging
-
-            logging.getLogger(__name__).exception("Failed to ensure chat metadata")
-
-        # 추천 결과 단계가 완료되었다면, Postgres에 Recommendation/Chat 저장
-        step = result.get("step")
-        if step == ChatStep.CHAT_RESULT and result.get("is_completed"):
-            rec_data = result.get("data") or {}
-            recommendation_list = (
-                rec_data.get("recommendation_list")
-                or rec_data.get("all_recommendations")
-                or rec_data.get("data")
-                or []
-            )
-             # user_info 기반으로 Chat 제목 생성 시도
-            user_info = result.get("user_info") or {}
-            size = user_info.get("size") or ""
-            lifestyle = user_info.get("lifestyle") or ""
-            budget_range = user_info.get("budget_range_manwon") or {}
-            min_budget = budget_range.get("min")
-            max_budget = budget_range.get("max")
-
-            if min_budget is not None and max_budget is not None:
-                budget_text = f"{min_budget}~{max_budget}만원"
-            elif min_budget is not None and max_budget is None:
-                budget_text = f"{min_budget}만원 이상"
-            elif min_budget is None and max_budget is not None:
-                budget_text = f"{max_budget}만원 이하"
-            else:
-                budget_text = "예산 미정"
-
-            # 예: "10~20평 1인 자취, 예산 150~300만원 진단"
-            # lifestyle가 없으면 생략
-            title_parts = []
-            if size:
-                title_parts.append(str(size))
-            if lifestyle:
-                title_parts.append(str(lifestyle))
-            title_prefix = " ".join(title_parts).strip()
-            if title_prefix:
-                chat_title = f"{title_prefix}, 예산 {budget_text} 진단"
-            else:
-                chat_title = f"가전/가구 추천, 예산 {budget_text} 진단"
-
-            try:
-                await save_recommendations_to_db(
-                    conv_id=payload.conv_id,
-                    recommendation_list=recommendation_list,
-                    chat_title=chat_title,
-                )
-            except Exception as e:
-                # 저장 실패는 추천 응답 자체에는 영향을 주지 않도록 로그만 남기는 것이 안전
-                # (여기서는 단순 예시라 re-raise 하지 않음)
-                import logging
-
-                logging.getLogger(__name__).exception(
-                    "Failed to save recommendations to DB: %s", e
-                )
 
         data = result.get("data", {}) or {}
         ai_response = result.get("ai_response")

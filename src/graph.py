@@ -7,11 +7,14 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END, START
 
+from .db import get_session_maker
+from .product_details import fetch_products_bundle_details
 from .state_store import get_checkpointer
 from .prompt import (
     build_package_reason_prompt,
     build_recommendation_prompt,
     build_rag_prompt,
+    build_rag_prompt_with_package_context,
 )
 from .recommend import generate_recommendation_result
 
@@ -302,7 +305,8 @@ async def node_chat_result(state: ChatState) -> ChatState:
                         {
                             "category": p.get("category"),
                             "name": p.get("name"),
-                            "model": p.get("model"),
+                            # 가전에는 model이 아니라 model_id만 출력합니다.
+                            "model_id": p.get("model_id") or p.get("model"),
                             "brand": p.get("brand"),
                             "price_normal": p.get("price_normal"),
                             "price_subscription": p.get("price_subscription"),
@@ -383,15 +387,82 @@ def node_rag_chat(state: ChatState) -> ChatState:
     # 현재 턴의 사용자 발화를 기록
     messages = _append_message(state, role="user", content=user_text)
 
-    prompt = build_rag_prompt(user_info, user_text)
+    new_data = dict(state.get("data") or {})
+
+    def _extract_package_index(text: str) -> Optional[int]:
+        # "1번", "2번", "3번 패키지", "첫번째/두번째/세번째" 정도만 간단 지원
+        import re
+
+        m = re.search(r"(\d+)\s*번", text)
+        if m:
+            try:
+                return int(m.group(1)) - 1
+            except ValueError:
+                return None
+        if "첫" in text:
+            return 0
+        if "두" in text:
+            return 1
+        if "세" in text:
+            return 2
+        return None
+
+    # 패키지 상세 질문이면: 해당 패키지의 model_id 목록으로 DB 상세를 가져와 프롬프트에 포함
+    prompt = None
+    package_idx = _extract_package_index(_to_str(user_text))
+    if package_idx is not None:
+        all_recs = new_data.get("all_recommendations") or []
+        if isinstance(all_recs, list) and 0 <= package_idx < len(all_recs):
+            pkg = all_recs[package_idx]
+            if isinstance(pkg, dict):
+                model_ids: list[str] = []
+                products = pkg.get("products") or []
+                if isinstance(products, list):
+                    for p in products:
+                        if isinstance(p, dict):
+                            mid = p.get("model_id")
+                            if mid:
+                                model_ids.append(str(mid))
+
+                if model_ids:
+                    try:
+                        session_maker = get_session_maker()
+                        async with session_maker() as session:
+                            details = await fetch_products_bundle_details(
+                                session, model_ids=model_ids
+                            )
+
+                        package_context = {
+                            "package_index": package_idx,
+                            "package_budgets": {
+                                "appliance_price_normal_sum": pkg.get(
+                                    "appliance_price_normal_sum"
+                                ),
+                                "appliance_price_subscription_sum": pkg.get(
+                                    "appliance_price_subscription_sum"
+                                ),
+                                "furniture_price_sum": pkg.get("furniture_price_sum"),
+                            },
+                            "products_details": details,
+                        }
+
+                        prompt = build_rag_prompt_with_package_context(
+                            user_info,
+                            _to_str(user_text),
+                            package_context=package_context,
+                        )
+                    except Exception:
+                        prompt = None
+
+    if prompt is None:
+        prompt = build_rag_prompt(user_info, user_text)
+
     resp = llm_json.invoke(prompt)
 
     data_json = _extract_json_from_llm_response(resp)
 
     request_more = bool(data_json.get("request_more_packages"))
     answer_text = data_json.get("answer", "")
-
-    new_data = dict(state.get("data") or {})
 
     if request_more:
         all_recs = new_data.get("all_recommendations") or []

@@ -151,7 +151,8 @@ async def save_recommendations_to_db(
                     names: list[str] = []
                     for p in products_field:
                         if isinstance(p, dict):
-                            n = p.get("name") or p.get("model") or ""
+                            # model/model_id 중 어떤 키가 와도 저장되게 방어
+                            n = p.get("name") or p.get("model_id") or p.get("model") or ""
                             if n:
                                 names.append(str(n))
                         elif isinstance(p, str):
