@@ -1,0 +1,50 @@
+name: Deploy FastAPI to EC2 (With .env)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    # 1. GitHub Secrets에서 가져온 내용으로 .env 파일 생성
+    - name: Create .env file
+      run: |
+        echo "${{ secrets.ENV_FILE }}" > .env
+        
+    # 2. 도커 이미지 빌드 (이때 .env 파일이 이미지 내부로 복사됨)
+    - name: Build and Save Docker Image
+      run: |
+        docker build -t fastapi_snowman_image .
+        docker save fastapi_snowman_image > fastapi_snowman.tar
+
+    # 3. 생성된 tar 파일을 EC2로 전송
+    - name: Copy Docker image to EC2
+      uses: appleboy/scp-action@master
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        source: "fastapi_snowman.tar"
+        target: "/home/${{ secrets.EC2_USERNAME }}"
+
+    # 4. EC2에서 기존 컨테이너 교체 및 실행
+    - name: Deploy to EC2
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          # 기존 컨테이너 중지 및 삭제
+          docker stop fastapi_snowman || true
+          docker rm fastapi_snowman || true
+          # 새 이미지 로드
+          docker load < /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar
+          # 실행 (이미지 안에 .env가 들어있으므로 추가 옵션 없이 실행 가능)
+          docker run -d -p 8000:8000 --name fastapi_snowman fastapi_snowman_image
