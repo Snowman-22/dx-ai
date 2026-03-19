@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -41,8 +42,6 @@ class ChatState(TypedDict, total=False):
     data: Dict[str, Any]
     is_completed: bool
     ai_response: str
-    # checkpointer가 복구한 기존 state의 `step`이 요청 값을 덮어쓰는 케이스가 있어,
-    # 요청에서 온 step_code를 별도 필드로 보관해 라우팅 우선순위를 강제합니다.
     requested_step_code: Optional[str]
 
 
@@ -54,19 +53,10 @@ def _to_str(x: Any) -> str:
     return str(x).strip() if x is not None else ""
 
 def _extract_json_from_llm_response(resp: Any) -> dict[str, Any]:
-    """
-    ChatOpenAI(response_format={"type":"json_object"}) 응답을
-    JSON dict로 안전하게 추출합니다.
-    - resp.content: 보통 JSON 문자열
-    - resp.dict()["content"]: 환경/버전에 따라 문자열로 내려올 수 있음
-    """
     import json as _json
-
-    # 1) 권장 경로: AIMessage.content
     if hasattr(resp, "content"):
         content = resp.content
     else:
-        # 2) 차선: dict 구조에서 content 키 추출
         try:
             content = resp.dict().get("content")
         except Exception:
@@ -76,74 +66,43 @@ def _extract_json_from_llm_response(resp: Any) -> dict[str, Any]:
         return _json.loads(content)
     if isinstance(content, dict):
         return content
-
-    # 마지막 방어: str로 강제 변환 후 시도(실패하면 예외 발생)
     return _json.loads(str(content))
 
 
 def _to_int_price(x: Any) -> int:
-    """
-    숫자/문자열(예: '2,500,000')을 정수로 변환합니다.
-    변환 불가면 0을 반환합니다.
-    """
-    if x is None:
-        return 0
-    if isinstance(x, bool):
-        return int(x)
-    if isinstance(x, (int,)):
-        return x
-    if isinstance(x, float):
-        return int(x)
+    if x is None: return 0
+    if isinstance(x, bool): return int(x)
+    if isinstance(x, (int, float)): return int(x)
     if isinstance(x, str):
-        s = x.strip()
-        if not s:
-            return 0
-        # "2,500,000" 같은 형식 처리
-        s = s.replace(",", "")
+        s = x.strip().replace(",", "")
         try:
-            if "." in s:
-                return int(float(s))
-            return int(s)
+            return int(float(s)) if "." in s else int(s)
         except ValueError:
             return 0
     return 0
 
 
 def _compute_budget_breakdown(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    패키지 기준 예산 3종 합계를 계산합니다.
-    - item이 패키지인 경우: item["products"]를 순회해 합산
-    - item이 단일 상품인 경우: 기존 방식(price_normal/price_subscription/price)으로 처리
-    """
-    # 패키지 구조: {"products":[{category,name,price_normal,price_subscription,price,...}, ...]}
     products = item.get("products")
     if isinstance(products, list):
         appliance_normal_sum = 0
         appliance_subscription_sum = 0
         furniture_price_sum = 0
-
         for p in products:
-            if not isinstance(p, dict):
-                continue
+            if not isinstance(p, dict): continue
             category = p.get("category")
-
-            # category가 명시되지 않아도 key가 있으면 분류
             is_appliance = category == "appliance" or ("price_normal" in p or "price_subscription" in p)
             is_furniture = category == "furniture" or ("price" in p and not is_appliance)
-
             if is_appliance:
                 appliance_normal_sum += _to_int_price(p.get("price_normal"))
                 appliance_subscription_sum += _to_int_price(p.get("price_subscription"))
             if is_furniture:
                 furniture_price_sum += _to_int_price(p.get("price"))
-
         return {
             "appliance_price_normal_sum": appliance_normal_sum,
             "appliance_price_subscription_sum": appliance_subscription_sum,
             "furniture_price_sum": furniture_price_sum,
         }
-
-    # 단일 상품 구조(구버전 호환)
     return {
         "appliance_price_normal_sum": _to_int_price(item.get("price_normal")),
         "appliance_price_subscription_sum": _to_int_price(item.get("price_subscription")),
@@ -159,7 +118,6 @@ def _parse_budget(user_text: Any) -> Dict[str, Any]:
     s = _to_str(user_text)
     if not s: raise ValueError("empty")
     if s.isdigit(): return {"budget_type": "number", "budget_manwon": int(s)}
-    
     normalized = s.replace(" ", "")
     mapping = {
         "50만원이하": {"min": 0, "max": 50},
@@ -172,7 +130,7 @@ def _parse_budget(user_text: Any) -> Dict[str, Any]:
         return {"budget_type": "choice", "budget_choice": user_text, "budget_range_manwon": mapping[normalized]}
     raise ValueError("invalid budget")
 
-# --- 노드 정의 (각 노드는 작업 후 'END'로 갈 수 있게 설계) ---
+# --- 노드 정의 ---
 
 def node_chat_0(state: ChatState) -> ChatState:
     return {**state, "step": ChatStep.CHAT_1, "data": {}, "is_completed": False}
@@ -186,7 +144,6 @@ def node_chat_1(state: ChatState) -> ChatState:
 def node_chat_2(state: ChatState) -> ChatState:
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
-    # 가전 정보 처리 로직 (생략 가능하지만 유지)
     owned = user_text.get("owned", []) if isinstance(user_text, dict) else (user_text if isinstance(user_text, list) else [])
     needed = user_text.get("needed", []) if isinstance(user_text, dict) else []
     user_info["owned_appliances"], user_info["needed_appliances"] = owned, needed
@@ -231,136 +188,97 @@ def node_chat_6(state: ChatState) -> ChatState:
     return {**state, "step": ChatStep.CHAT_6, "messages": _append_message(state, role="user", content=user_text)}
 
 async def node_chat_result(state: ChatState) -> ChatState:
-    """
-    추천 결과 생성.
-    - DB 기반 추천(재랭킹/패키징) 시도
-    - NotImplementedError(알고리즘 미이식)면 LLM JSON 모드로 폴백
-    """
     user_info = state.get("user_info") or {}
     messages = list(state.get("messages") or [])
 
     try:
         result = await generate_recommendation_result(user_info=user_info)
-        # 알고리즘 결과를 "패키지 리스트"로 정규화
         full_recommendation_list = []
         for item in result.recommendation_list:
-            # 패키지 구조(dict)로 바로 들어오는 경우
             if isinstance(item, dict):
                 full_recommendation_list.append(item)
                 continue
-
-            # dataclass/객체 형태인 경우 기존 변환 로직 유지
-            full_recommendation_list.append(
-                {
-                    "category": getattr(item, "category", None),
-                    "package_name": getattr(item, "package_name", None),
-                    "name": getattr(item, "package_name", getattr(item, "name", "")) or getattr(item, "name", ""),
-                    "products": getattr(item, "products", None),
-                    "reason": getattr(item, "reason", None),
-                    "estimated_price": getattr(item, "estimated_price", None),
-                }
-            )
+            full_recommendation_list.append({
+                "category": getattr(item, "category", None),
+                "package_name": getattr(item, "package_name", None),
+                "name": getattr(item, "package_name", getattr(item, "name", "")) or getattr(item, "name", ""),
+                "products": getattr(item, "products", None),
+                "reason": getattr(item, "reason", None),
+                "estimated_price": getattr(item, "estimated_price", None),
+            })
         total_estimated_budget = result.total_estimated_budget
     except NotImplementedError:
         prompt = build_recommendation_prompt(user_info)
-        resp = llm_json.invoke(prompt)
-
+        resp = await llm_json.ainvoke(prompt) # 비동기 환경이므로 ainvoke 추천
         content_json = _extract_json_from_llm_response(resp)
-
-        # LLM 폴백 결과는 프롬프트 스키마에 맞춰 recommendation_list/total_estimated_budget만 추출
-        full_recommendation_list = (
-            content_json.get("recommendation_list")
-            or content_json.get("data")
-            or []
-        )
+        full_recommendation_list = content_json.get("recommendation_list") or content_json.get("data") or []
         total_estimated_budget = content_json.get("total_estimated_budget", "")
 
-    # (추가) 각 추천 항목(패키지)별 예산 3종 분해 + reason LLM 생성
     if not isinstance(full_recommendation_list, list):
         full_recommendation_list = []
 
-    # 예산 필드 계산(없으면 0)
     for item in full_recommendation_list:
         if isinstance(item, dict):
-            item.setdefault(
-                "name",
-                item.get("package_name") or item.get("name") or item.get("title") or "",
-            )
+            item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
             item.update(_compute_budget_breakdown(item))
 
-    # (요구사항) reason은 무조건 LLM으로 생성
     if full_recommendation_list:
         packages_payload: list[Dict[str, Any]] = []
         for i, item in enumerate(full_recommendation_list):
-            if not isinstance(item, dict):
-                continue
+            if not isinstance(item, dict): continue
             package_name = item.get("name") or item.get("package_name") or f"패키지_{i+1}"
             products = item.get("products") or []
-            simplified_products: list[Dict[str, Any]] = []
+            simplified_products = []
             if isinstance(products, list):
                 for p in products:
-                    if not isinstance(p, dict):
-                        continue
-                    simplified_products.append(
-                        {
-                            "category": p.get("category"),
-                            "name": p.get("name"),
-                            # 가전에는 model이 아니라 model_id만 출력합니다.
-                            "model_id": p.get("model_id") or p.get("model"),
-                            "brand": p.get("brand"),
-                            "price_normal": p.get("price_normal"),
-                            "price_subscription": p.get("price_subscription"),
-                            "price": p.get("price"),
-                            "image_url": p.get("image_url"),
-                            "url": p.get("url"),
-                        }
-                    )
+                    if not isinstance(p, dict): continue
+                    simplified_products.append({
+                        "category": p.get("category"),
+                        "name": p.get("name"),
+                        "model_id": p.get("model_id") or p.get("model"),
+                        "brand": p.get("brand"),
+                        "price_normal": p.get("price_normal"),
+                        "price_subscription": p.get("price_subscription"),
+                        "price": p.get("price"),
+                        "image_url": p.get("image_url"),
+                        "url": p.get("url"),
+                    })
 
-            packages_payload.append(
-                {
-                    "index": i,
-                    "package_name": package_name,
-                    "products": simplified_products,
-                    "appliance_price_normal_sum": item.get("appliance_price_normal_sum"),
-                    "appliance_price_subscription_sum": item.get("appliance_price_subscription_sum"),
-                    "furniture_price_sum": item.get("furniture_price_sum"),
-                }
-            )
+            packages_payload.append({
+                "index": i,
+                "package_name": package_name,
+                "products": simplified_products,
+                "appliance_price_normal_sum": item.get("appliance_price_normal_sum"),
+                "appliance_price_subscription_sum": item.get("appliance_price_subscription_sum"),
+                "furniture_price_sum": item.get("furniture_price_sum"),
+            })
 
         reason_prompt = build_package_reason_prompt(user_info, packages_payload)
-        resp = llm_json.invoke(reason_prompt)
+        resp = await llm_json.ainvoke(reason_prompt)
         reasons_json = _extract_json_from_llm_response(resp)
         reasons = reasons_json.get("reasons") or []
 
-        # index 기반으로 주입
         for i, item in enumerate(full_recommendation_list):
-            if not isinstance(item, dict):
-                continue
-            item["reason"] = item.get("reason") or ""
-
+            if isinstance(item, dict):
+                item["reason"] = item.get("reason") or ""
         for r in reasons:
-            if not isinstance(r, dict):
-                continue
+            if not isinstance(r, dict): continue
             idx = r.get("index")
             if isinstance(idx, int) and 0 <= idx < len(full_recommendation_list):
                 if isinstance(full_recommendation_list[idx], dict):
                     full_recommendation_list[idx]["reason"] = r.get("reason") or full_recommendation_list[idx].get("reason")
 
-    # 처음에는 상위 3개만 노출하고, 나머지는 RAG_CHAT에서 점진적으로 사용
     display_recommendations = full_recommendation_list[:3]
     next_index = len(display_recommendations)
 
-    # 추천 결과를 messages 로그에 남김
-    messages.append(
-        {
-            "role": "assistant",
-            "content": {
-                "type": "recommendation_result",
-                "display_recommendations": display_recommendations,
-                "total_estimated_budget": total_estimated_budget,
-            },
-        }
-    )
+    messages.append({
+        "role": "assistant",
+        "content": {
+            "type": "recommendation_result",
+            "display_recommendations": display_recommendations,
+            "total_estimated_budget": total_estimated_budget,
+        },
+    })
 
     return {
         **state,
@@ -375,39 +293,23 @@ async def node_chat_result(state: ChatState) -> ChatState:
         "is_completed": True,
     }
 
-def node_rag_chat(state: ChatState) -> ChatState:
-    """
-    추천 이후 자유대화.
-    - 사용자의 의도를 JSON으로 판별(request_more_packages / answer)
-    - request_more_packages=true면 다음 3개 배치를 display_recommendations로 업데이트
-    """
+# ⭐ 수정 포인트: async def 로 변경
+async def node_rag_chat(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
     user_text = state.get("last_user_input") or ""
-
-    # 현재 턴의 사용자 발화를 기록
     messages = _append_message(state, role="user", content=user_text)
-
     new_data = dict(state.get("data") or {})
 
     def _extract_package_index(text: str) -> Optional[int]:
-        # "1번", "2번", "3번 패키지", "첫번째/두번째/세번째" 정도만 간단 지원
-        import re
-
         m = re.search(r"(\d+)\s*번", text)
         if m:
-            try:
-                return int(m.group(1)) - 1
-            except ValueError:
-                return None
-        if "첫" in text:
-            return 0
-        if "두" in text:
-            return 1
-        if "세" in text:
-            return 2
+            try: return int(m.group(1)) - 1
+            except ValueError: return None
+        if "첫" in text: return 0
+        if "두" in text: return 1
+        if "세" in text: return 2
         return None
 
-    # 패키지 상세 질문이면: 해당 패키지의 model_id 목록으로 DB 상세를 가져와 프롬프트에 포함
     prompt = None
     package_idx = _extract_package_index(_to_str(user_text))
     if package_idx is not None:
@@ -415,41 +317,32 @@ def node_rag_chat(state: ChatState) -> ChatState:
         if isinstance(all_recs, list) and 0 <= package_idx < len(all_recs):
             pkg = all_recs[package_idx]
             if isinstance(pkg, dict):
-                model_ids: list[str] = []
+                model_ids = []
                 products = pkg.get("products") or []
                 if isinstance(products, list):
                     for p in products:
                         if isinstance(p, dict):
                             mid = p.get("model_id")
-                            if mid:
-                                model_ids.append(str(mid))
-
+                            if mid: model_ids.append(str(mid))
                 if model_ids:
                     try:
                         session_maker = get_session_maker()
+                        # 이제 async def 안이므로 정상 작동합니다!
                         async with session_maker() as session:
                             details = await fetch_products_bundle_details(
                                 session, model_ids=model_ids
                             )
-
                         package_context = {
                             "package_index": package_idx,
                             "package_budgets": {
-                                "appliance_price_normal_sum": pkg.get(
-                                    "appliance_price_normal_sum"
-                                ),
-                                "appliance_price_subscription_sum": pkg.get(
-                                    "appliance_price_subscription_sum"
-                                ),
+                                "appliance_price_normal_sum": pkg.get("appliance_price_normal_sum"),
+                                "appliance_price_subscription_sum": pkg.get("appliance_price_subscription_sum"),
                                 "furniture_price_sum": pkg.get("furniture_price_sum"),
                             },
                             "products_details": details,
                         }
-
                         prompt = build_rag_prompt_with_package_context(
-                            user_info,
-                            _to_str(user_text),
-                            package_context=package_context,
+                            user_info, _to_str(user_text), package_context=package_context
                         )
                     except Exception:
                         prompt = None
@@ -457,17 +350,14 @@ def node_rag_chat(state: ChatState) -> ChatState:
     if prompt is None:
         prompt = build_rag_prompt(user_info, user_text)
 
-    resp = llm_json.invoke(prompt)
-
+    resp = await llm_json.ainvoke(prompt)
     data_json = _extract_json_from_llm_response(resp)
-
     request_more = bool(data_json.get("request_more_packages"))
     answer_text = data_json.get("answer", "")
 
     if request_more:
         all_recs = new_data.get("all_recommendations") or []
         next_index = int(new_data.get("next_index", 0))
-
         if next_index >= len(all_recs):
             new_data["display_recommendations"] = []
             new_data["error"] = "모든 패키지 조합을 보여드렸습니다."
@@ -476,9 +366,7 @@ def node_rag_chat(state: ChatState) -> ChatState:
             new_data["display_recommendations"] = batch
             new_data["next_index"] = next_index + len(batch)
 
-    # assistant 응답을 메시지 로그에 추가
     messages.append({"role": "assistant", "content": answer_text})
-
     return {
         **state,
         "step": ChatStep.RAG_CHAT,
@@ -488,30 +376,19 @@ def node_rag_chat(state: ChatState) -> ChatState:
         "is_completed": True,
     }
 
-# --- 라우터 함수 ---
 def route_from_step(state: ChatState) -> str:
     requested = state.get("requested_step_code")
-    if requested:
-        try:
-            step = ChatStep(requested)
-        except ValueError:
-            step = state.get("step", ChatStep.CHAT_0)
-    else:
-        step = state.get("step", ChatStep.CHAT_0)
+    step = ChatStep(requested) if requested and requested in ChatStep.__members__ else state.get("step", ChatStep.CHAT_0)
     mapping = {
-        ChatStep.CHAT_0: "chat_0", ChatStep.CHAT_1: "chat_1",
-        ChatStep.CHAT_2: "chat_2", ChatStep.CHAT_3: "chat_3",
-        ChatStep.CHAT_3_1: "chat_3_1", ChatStep.CHAT_4: "chat_4",
+        ChatStep.CHAT_0: "chat_0", ChatStep.CHAT_1: "chat_1", ChatStep.CHAT_2: "chat_2",
+        ChatStep.CHAT_3: "chat_3", ChatStep.CHAT_3_1: "chat_3_1", ChatStep.CHAT_4: "chat_4",
         ChatStep.CHAT_5: "chat_5", ChatStep.CHAT_6: "chat_6",
         ChatStep.CHAT_RESULT: "chat_result", ChatStep.RAG_CHAT: "rag_chat"
     }
     return mapping.get(step, "chat_0")
 
-# --- 그래프 빌드 ---
 def build_graph():
     workflow = StateGraph(ChatState)
-
-    # 1. 노드 추가
     nodes = {
         "chat_0": node_chat_0, "chat_1": node_chat_1, "chat_2": node_chat_2,
         "chat_3": node_chat_3, "chat_3_1": node_chat_3_1, "chat_4": node_chat_4,
@@ -520,15 +397,9 @@ def build_graph():
     }
     for name, func in nodes.items():
         workflow.add_node(name, func)
-
-    # 2. 시작점 설정 (현재 step을 보고 바로 해당 노드로 점프!)
     workflow.add_conditional_edges(START, route_from_step)
-
-    # 3. 모든 노드의 끝을 END로 연결 (이게 무한루프 해결 포인트!)
     for name in nodes.keys():
         workflow.add_edge(name, END)
-
-    app = workflow.compile(checkpointer=get_checkpointer())
-    return app
+    return workflow.compile(checkpointer=get_checkpointer())
 
 chat_app = build_graph()
