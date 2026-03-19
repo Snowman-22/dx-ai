@@ -14,6 +14,10 @@ from src.state_store import get_checkpointer
 from src.db import get_engine
 from src.recommend.service import ensure_chat_metadata, save_recommendations_to_db
 
+from sqlalchemy import text
+from src.db import get_engine  # 이미 있다면 패스!
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends
 
 class ChatRequest(BaseModel):
     # 하나의 conv_id(문자열)로 채팅 세션을 식별
@@ -70,7 +74,9 @@ def create_app() -> FastAPI:
         # step_code는 "프론트/스프링이 가진 현재 단계"이며, FastAPI는 이를 기준으로 라우팅합니다.
         # (checkpoint에 저장된 step이 있더라도, 요청으로 들어온 step_code를 우선합니다.)
         state: ChatState = {
-            "step": ChatStep(payload.step_code),
+            # checkpointer가 복구한 기존 step이 라우팅에 우선 적용될 수 있어,
+            # 요청에서 넘어온 step_code를 별도 필드로 보관하고 그래프 라우팅에서 우선순위를 강제합니다.
+            "requested_step_code": payload.step_code,
             "incoming_assistant_message": payload.assistant_text,
             "last_user_input": payload.user_text,
         }
@@ -154,6 +160,37 @@ def create_app() -> FastAPI:
                 data = {"message": "성공적으로 저장되었습니다."}
 
         return ChatResponse(data=data, ai_response=ai_response)
+
+
+
+
+    # DB 세션을 가져오는 의존성 주입 함수 (만약 이미 src.db 등에 있다면 그걸 써도 돼!)
+    async def get_db():
+        engine = get_engine()
+        async with AsyncSession(engine) as session:
+            try:
+                yield session
+            finally:
+                await session.close()
+
+    @app.get("/users/all")
+    async def get_all_test_users(db: AsyncSession = Depends(get_db)):
+        try:
+            # 안전하게 public.test_user라고 명시
+            query = text("SELECT * FROM public.test_user")
+            result = await db.execute(query)
+            
+            # 조회 결과를 딕셔너리 리스트로 변환
+            users = [dict(row) for row in result.mappings().all()]
+            
+            return {
+                "status": "success",
+                "count": len(users),
+                "data": users
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"RDS 조회 실패: {str(e)}")
+
 
     @app.get("/health")
     async def health():

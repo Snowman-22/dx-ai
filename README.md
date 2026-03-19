@@ -71,7 +71,7 @@ AWS_SECRET_ACCESS_KEY=test
 ```
 
 - Localstack 기본 포트: `4566`
-- DynamoDB Local 기본 포트: `8000` → `AWS_ENDPOINT_URL=http://localhost:8000`
+- DynamoDB Local 기본 포트: `8001` → `AWS_ENDPOINT_URL=http://localhost:8001`
 
 **로컬 → 실제 AWS 전환**: `.env`에서 `AWS_ENDPOINT_URL`을 제거(또는 주석 처리)하고, `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`를 실제 키로 바꾸면 됩니다. 코드 수정 없이 환경 변수만으로 전환 가능합니다.
 
