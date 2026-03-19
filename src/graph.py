@@ -8,7 +8,11 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END, START
 
 from .state_store import get_checkpointer
-from .prompt import build_recommendation_prompt, build_rag_prompt
+from .prompt import (
+    build_package_reason_prompt,
+    build_recommendation_prompt,
+    build_rag_prompt,
+)
 from .recommend import generate_recommendation_result
 
 
@@ -72,6 +76,76 @@ def _extract_json_from_llm_response(resp: Any) -> dict[str, Any]:
 
     # 마지막 방어: str로 강제 변환 후 시도(실패하면 예외 발생)
     return _json.loads(str(content))
+
+
+def _to_int_price(x: Any) -> int:
+    """
+    숫자/문자열(예: '2,500,000')을 정수로 변환합니다.
+    변환 불가면 0을 반환합니다.
+    """
+    if x is None:
+        return 0
+    if isinstance(x, bool):
+        return int(x)
+    if isinstance(x, (int,)):
+        return x
+    if isinstance(x, float):
+        return int(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return 0
+        # "2,500,000" 같은 형식 처리
+        s = s.replace(",", "")
+        try:
+            if "." in s:
+                return int(float(s))
+            return int(s)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _compute_budget_breakdown(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    패키지 기준 예산 3종 합계를 계산합니다.
+    - item이 패키지인 경우: item["products"]를 순회해 합산
+    - item이 단일 상품인 경우: 기존 방식(price_normal/price_subscription/price)으로 처리
+    """
+    # 패키지 구조: {"products":[{category,name,price_normal,price_subscription,price,...}, ...]}
+    products = item.get("products")
+    if isinstance(products, list):
+        appliance_normal_sum = 0
+        appliance_subscription_sum = 0
+        furniture_price_sum = 0
+
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            category = p.get("category")
+
+            # category가 명시되지 않아도 key가 있으면 분류
+            is_appliance = category == "appliance" or ("price_normal" in p or "price_subscription" in p)
+            is_furniture = category == "furniture" or ("price" in p and not is_appliance)
+
+            if is_appliance:
+                appliance_normal_sum += _to_int_price(p.get("price_normal"))
+                appliance_subscription_sum += _to_int_price(p.get("price_subscription"))
+            if is_furniture:
+                furniture_price_sum += _to_int_price(p.get("price"))
+
+        return {
+            "appliance_price_normal_sum": appliance_normal_sum,
+            "appliance_price_subscription_sum": appliance_subscription_sum,
+            "furniture_price_sum": furniture_price_sum,
+        }
+
+    # 단일 상품 구조(구버전 호환)
+    return {
+        "appliance_price_normal_sum": _to_int_price(item.get("price_normal")),
+        "appliance_price_subscription_sum": _to_int_price(item.get("price_subscription")),
+        "furniture_price_sum": _to_int_price(item.get("price")),
+    }
 
 def _append_message(state: ChatState, *, role: str, content: Any) -> List[Dict[str, Any]]:
     messages = list(state.get("messages") or [])
@@ -164,16 +238,25 @@ async def node_chat_result(state: ChatState) -> ChatState:
 
     try:
         result = await generate_recommendation_result(user_info=user_info)
-        # 알고리즘 결과를 통일된 패키지 리스트 형태로 변환
-        full_recommendation_list = [
-            {
-                "package_name": getattr(item, "package_name", getattr(item, "name", "")),
-                "products": getattr(item, "products", [getattr(item, "name", "")]),
-                "reason": item.reason,
-                "estimated_price": item.estimated_price,
-            }
-            for item in result.recommendation_list
-        ]
+        # 알고리즘 결과를 "패키지 리스트"로 정규화
+        full_recommendation_list = []
+        for item in result.recommendation_list:
+            # 패키지 구조(dict)로 바로 들어오는 경우
+            if isinstance(item, dict):
+                full_recommendation_list.append(item)
+                continue
+
+            # dataclass/객체 형태인 경우 기존 변환 로직 유지
+            full_recommendation_list.append(
+                {
+                    "category": getattr(item, "category", None),
+                    "package_name": getattr(item, "package_name", None),
+                    "name": getattr(item, "package_name", getattr(item, "name", "")) or getattr(item, "name", ""),
+                    "products": getattr(item, "products", None),
+                    "reason": getattr(item, "reason", None),
+                    "estimated_price": getattr(item, "estimated_price", None),
+                }
+            )
         total_estimated_budget = result.total_estimated_budget
     except NotImplementedError:
         prompt = build_recommendation_prompt(user_info)
@@ -182,8 +265,82 @@ async def node_chat_result(state: ChatState) -> ChatState:
         content_json = _extract_json_from_llm_response(resp)
 
         # LLM 폴백 결과는 프롬프트 스키마에 맞춰 recommendation_list/total_estimated_budget만 추출
-        full_recommendation_list = content_json.get("recommendation_list", [])
+        full_recommendation_list = (
+            content_json.get("recommendation_list")
+            or content_json.get("data")
+            or []
+        )
         total_estimated_budget = content_json.get("total_estimated_budget", "")
+
+    # (추가) 각 추천 항목(패키지)별 예산 3종 분해 + reason LLM 생성
+    if not isinstance(full_recommendation_list, list):
+        full_recommendation_list = []
+
+    # 예산 필드 계산(없으면 0)
+    for item in full_recommendation_list:
+        if isinstance(item, dict):
+            item.setdefault(
+                "name",
+                item.get("package_name") or item.get("name") or item.get("title") or "",
+            )
+            item.update(_compute_budget_breakdown(item))
+
+    # (요구사항) reason은 무조건 LLM으로 생성
+    if full_recommendation_list:
+        packages_payload: list[Dict[str, Any]] = []
+        for i, item in enumerate(full_recommendation_list):
+            if not isinstance(item, dict):
+                continue
+            package_name = item.get("name") or item.get("package_name") or f"패키지_{i+1}"
+            products = item.get("products") or []
+            simplified_products: list[Dict[str, Any]] = []
+            if isinstance(products, list):
+                for p in products:
+                    if not isinstance(p, dict):
+                        continue
+                    simplified_products.append(
+                        {
+                            "category": p.get("category"),
+                            "name": p.get("name"),
+                            "model": p.get("model"),
+                            "brand": p.get("brand"),
+                            "price_normal": p.get("price_normal"),
+                            "price_subscription": p.get("price_subscription"),
+                            "price": p.get("price"),
+                            "image_url": p.get("image_url"),
+                            "url": p.get("url"),
+                        }
+                    )
+
+            packages_payload.append(
+                {
+                    "index": i,
+                    "package_name": package_name,
+                    "products": simplified_products,
+                    "appliance_price_normal_sum": item.get("appliance_price_normal_sum"),
+                    "appliance_price_subscription_sum": item.get("appliance_price_subscription_sum"),
+                    "furniture_price_sum": item.get("furniture_price_sum"),
+                }
+            )
+
+        reason_prompt = build_package_reason_prompt(user_info, packages_payload)
+        resp = llm_json.invoke(reason_prompt)
+        reasons_json = _extract_json_from_llm_response(resp)
+        reasons = reasons_json.get("reasons") or []
+
+        # index 기반으로 주입
+        for i, item in enumerate(full_recommendation_list):
+            if not isinstance(item, dict):
+                continue
+            item["reason"] = item.get("reason") or ""
+
+        for r in reasons:
+            if not isinstance(r, dict):
+                continue
+            idx = r.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(full_recommendation_list):
+                if isinstance(full_recommendation_list[idx], dict):
+                    full_recommendation_list[idx]["reason"] = r.get("reason") or full_recommendation_list[idx].get("reason")
 
     # 처음에는 상위 3개만 노출하고, 나머지는 RAG_CHAT에서 점진적으로 사용
     display_recommendations = full_recommendation_list[:3]

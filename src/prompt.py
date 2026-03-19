@@ -68,3 +68,54 @@ def build_rag_prompt(user_info: Dict[str, Any], user_question: str) -> str:
 - JSON 이외의 설명 문장은 절대 출력하지 않는다.
 """
 
+
+def build_package_reason_prompt(
+    user_info: Dict[str, Any],
+    packages: list[Dict[str, Any]],
+) -> str:
+    """
+    packages(추천 패키지/항목) 각각에 대해 추천 이유 1~2문장을 생성합니다.
+    """
+    return f"""
+당신은 1인 자취/소형 공간에 특화된 인테리어 및 가전·가구 전문가입니다.
+
+아래는 사용자의 정보와 추천 패키지 목록입니다.
+
+요구사항(매우 중요):
+1) reason은 반드시 "한 줄"로 작성하세요. (줄바꿈 문자 \\n, \\r 금지)
+2) reason에는 가전명/가구명(제품명)을 넣지 마세요.
+3) 대신, reason 한 줄 안에 "이 패키지가 어떤 조합/특징으로 추천되었는지"가 드러나야 합니다.
+   - 패키지 조합의 근거는 3종 예산 합계(appliance_price_normal_sum, appliance_price_subscription_sum, furniture_price_sum)를 활용하세요.
+4) reason의 내용은 아래 키워드를 반영해 아주 간단히 요약하세요.
+   - 에너지절약형/에코프렌드리/화이트&블랙처럼 사용자의 조건(예: interior_style, budget_range 등)
+5) 감탄사 없이, 근거 기반으로 1줄만 출력하세요.
+
+[사용자 정보]
+- 평수: {user_info.get("size")}
+- 보유 가전: {user_info.get("owned_appliances")}
+- 필요 가전: {user_info.get("needed_appliances")}
+- 가구/소품 추천 필요: {user_info.get("need_furniture")}
+- 가구/소품 요청사항: {user_info.get("furniture_note")}
+- 인테리어 스타일: {user_info.get("interior_style")}
+- 라이프스타일: {user_info.get("lifestyle")}
+- 예산 입력: {user_info.get("budget_choice") or user_info.get("budget_manwon")}
+- 예산 범위(만원): {user_info.get("budget_range_manwon")}
+
+[추천 패키지들]
+{{
+  "packages": {packages}
+}}
+
+너의 출력은 반드시 아래 JSON 형식을 정확히 따르세요.
+설명 문장은 절대 출력하지 마세요.
+{{
+  "reasons": [
+    {{
+      "index": 0,
+      "reason": "패키지 조합의 특징(3종 예산 합 근거) + 1줄 조건 반영(제품명 없이)"
+    }}
+  ]
+}}
+reasons 배열의 길이는 반드시 packages 배열의 길이와 같아야 하고, 각 항목의 index에 대해 reason을 반드시 채워 주세요.
+"""
+

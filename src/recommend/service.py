@@ -109,8 +109,15 @@ async def save_recommendations_to_db(
 
     - conv_id: 프론트/체크포인터에서 사용하는 conv_id (LangGraph thread_id와 동일)
     - recommendation_list: graph.node_chat_result에서 내려오는 리스트
-      각 원소 예시:
-      {"category": "...", "name": "...", "reason": "...", "estimated_price": ...}
+      각 원소(패키지) 예시:
+      {
+        "name": "패키지 A",
+        "reason": "...",
+        "products": [
+          {"category":"appliance","name":"LG ...","price_normal": ...},
+          {"category":"furniture","name":"한샘 ...","price": ...}
+        ]
+      }
     """
     if not recommendation_list:
         return
@@ -125,13 +132,36 @@ async def save_recommendations_to_db(
             )
 
             for item in recommendation_list:
-                reason = str(item.get("reason") or "") or None
-                name = str(item.get("name") or "") or None
+                if not isinstance(item, dict):
+                    continue
 
-                # 현재 스키마상 products가 배열이므로, 단일 추천도 1개짜리 배열로 저장
+                reason = str(item.get("reason") or "") or None
+                package_name = (
+                    item.get("package_name")
+                    or item.get("name")
+                    or item.get("title")
+                    or ""
+                )
+
+                products_field = item.get("products")
                 products: Optional[list[str]] = None
-                if name:
-                    products = [name]
+
+                # 패키지 안에 products가 dict/object 배열로 들어오는 경우
+                if isinstance(products_field, list):
+                    names: list[str] = []
+                    for p in products_field:
+                        if isinstance(p, dict):
+                            n = p.get("name") or p.get("model") or ""
+                            if n:
+                                names.append(str(n))
+                        elif isinstance(p, str):
+                            if p:
+                                names.append(p)
+                    products = names or None
+
+                # 구버전 호환: products_field가 없으면 package_name을 1개로 저장
+                if products is None and package_name:
+                    products = [str(package_name)]
 
                 rec = Recommendation(
                     chat_id=chat.chat_id,

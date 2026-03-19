@@ -95,7 +95,12 @@ def create_app() -> FastAPI:
         step = result.get("step")
         if step == ChatStep.CHAT_RESULT and result.get("is_completed"):
             rec_data = result.get("data") or {}
-            recommendation_list = rec_data.get("recommendation_list") or []
+            recommendation_list = (
+                rec_data.get("recommendation_list")
+                or rec_data.get("all_recommendations")
+                or rec_data.get("data")
+                or []
+            )
              # user_info 기반으로 Chat 제목 생성 시도
             user_info = result.get("user_info") or {}
             size = user_info.get("size") or ""
