@@ -29,8 +29,11 @@ class ChatStep(str, Enum):
     CHAT_4 = "CHAT_4"  # 라이프스타일
     CHAT_5 = "CHAT_5"  # 예산
     CHAT_6 = "CHAT_6"  # 진단 완료
+    CHAT_7 = "CHAT_7"  # 배치 제안 보기
     CHAT_RESULT = "CHAT_RESULT"  # 추천 결과
     RAG_CHAT = "RAG_CHAT"  # 추천 이후 자유대화
+    CHAT_10 = "CHAT_10"  # 다시 추천받기
+    CHAT_11 = "CHAT_11"  # 진단 종료
 
 
 class ChatState(TypedDict, total=False):
@@ -115,19 +118,153 @@ def _append_message(state: ChatState, *, role: str, content: Any) -> List[Dict[s
     return messages
 
 def _parse_budget(user_text: Any) -> Dict[str, Any]:
+    """
+    사용자 예산 입력을 LLM 프롬프트가 쓰는 형태로 정규화합니다.
+
+    반환 스키마(기존 호환):
+    - budget_choice: 문자열(프롬프트 '예산 입력'에 사용)
+    - budget_range_manwon: {"min": int|None, "max": int|None} (프롬프트 '예산 범위(만원)'에 사용)
+    - budget_type: "number" | "choice" | "subscription"
+    """
+    def _range_dict(min_v: Any, max_v: Any) -> Dict[str, Any]:
+        return {"min": None if min_v is None else int(min_v), "max": None if max_v is None else int(max_v)}
+
+    # 1) 이미 프론트가 dict로 준 경우(버튼 선택 결과 구조화)
+    if isinstance(user_text, dict):
+        budget_choice = user_text.get("budget_choice")
+        budget_range = user_text.get("budget_range_manwon")
+        if isinstance(budget_choice, str) and isinstance(budget_range, dict):
+            return {
+                "budget_type": user_text.get("budget_type") or "choice",
+                "budget_choice": budget_choice,
+                "budget_range_manwon": _range_dict(budget_range.get("min"), budget_range.get("max")),
+            }
+
+        mode = user_text.get("budget_mode") or user_text.get("budget_type") or user_text.get("mode")
+        mode_s = _to_str(mode).lower()
+
+        # 구독 월 납입 범위 -> 일시불 추정(가정값)
+        # (프론트/정책에서 확정 계약 기간을 주면 그 값을 쓰도록 확장 가능)
+        if mode_s in {"subscription", "subscribe", "monthly_subscription", "월구독", "구독"}:
+            monthly = user_text.get("monthly_range_manwon") or user_text.get("monthly_range") or user_text.get("monthly")
+            if isinstance(monthly, dict) and ("min" in monthly or "max" in monthly):
+                factor = int(_to_str(user_text.get("subscription_months_factor") or 48))  # 기본 48개월 가정
+                mn = monthly.get("min")
+                mx = monthly.get("max")
+                one_min = None if mn is None else int(mn) * factor
+                one_max = None if mx is None else int(mx) * factor
+                return {
+                    "budget_type": "subscription",
+                    "budget_choice": user_text.get("budget_choice") or f"월 구독({mn}~{mx}만 원대)",
+                    "budget_range_manwon": _range_dict(one_min, one_max),
+                }
+
+        # 일시불 범위
+        if mode_s in {"one_time", "one-time", "fixed", "cash", "일시불"}:
+            rng = (
+                user_text.get("one_time_range_manwon")
+                or user_text.get("one_time_range")
+                or user_text.get("fixed_range_manwon")
+                or user_text.get("fixed_range")
+            )
+            if isinstance(rng, dict) and ("min" in rng or "max" in rng):
+                return {
+                    "budget_type": "choice",
+                    "budget_choice": user_text.get("budget_choice") or "일시불",
+                    "budget_range_manwon": _range_dict(rng.get("min"), rng.get("max")),
+                }
+
+        # dict인데 위 케이스로 파싱이 안 되면 문자열로도 한 번 더 시도
+        # (예: {"btn":"btn2"} 같은 형태)
+        user_text = user_text.get("text") or user_text.get("value") or user_text.get("btn") or user_text
+
+    # 2) 문자열/숫자 파싱
     s = _to_str(user_text)
-    if not s: raise ValueError("empty")
-    if s.isdigit(): return {"budget_type": "number", "budget_manwon": int(s)}
+    if not s:
+        raise ValueError("empty")
+
+    if s.isdigit():
+        return {"budget_type": "number", "budget_manwon": int(s)}
+
     normalized = s.replace(" ", "")
-    mapping = {
+
+    # 기존(구버전) 예산 범위 매핑
+    legacy_mapping = {
         "50만원이하": {"min": 0, "max": 50},
         "50~150만원": {"min": 50, "max": 150},
         "150~300만원": {"min": 150, "max": 300},
         "300만원이상": {"min": 300, "max": None},
         "아직정하지않았어요": {"min": None, "max": None},
     }
-    if normalized in mapping:
-        return {"budget_type": "choice", "budget_choice": user_text, "budget_range_manwon": mapping[normalized]}
+
+    if normalized in legacy_mapping:
+        return {
+            "budget_type": "choice",
+            "budget_choice": user_text,
+            "budget_range_manwon": legacy_mapping[normalized],
+        }
+
+    lowered = normalized.lower()
+
+    # 새 UI: 잘 모르겠어요
+    if "모르" in lowered or "잘모" in lowered or lowered in {"아직정하지않았어요", "아직모르겠어요"}:
+        return {
+            "budget_type": "choice",
+            "budget_choice": "아직정하지않았어요",
+            "budget_range_manwon": {"min": None, "max": None},
+        }
+
+    # 새 UI: 구독 월 범위 -> 일시불 추정(48개월 가정)
+    # 예: "월3~5만 원대", "월 5~10만 원대"
+    if "월" in lowered and "만" in lowered and ("~" in normalized or "-" in normalized):
+        m = re.search(r"월.*?([0-9]+)\s*[~\-]\s*([0-9]+)\s*만", normalized)
+        if m:
+            monthly_min = int(m.group(1))
+            monthly_max = int(m.group(2))
+            factor = 48
+            return {
+                "budget_type": "subscription",
+                "budget_choice": f"월구독({monthly_min}~{monthly_max}만 원대)",
+                "budget_range_manwon": _range_dict(monthly_min * factor, monthly_max * factor),
+            }
+
+        # "월3만" 처럼 단일 값으로 들어오는 경우(드물지만 방어)
+        m2 = re.search(r"월.*?([0-9]+)\s*만", normalized)
+        if m2:
+            monthly = int(m2.group(1))
+            factor = 48
+            return {
+                "budget_type": "subscription",
+                "budget_choice": f"월구독({monthly}만)",
+                "budget_range_manwon": _range_dict(monthly * factor, None),
+            }
+
+    # 새 UI: 일시불 범위
+    # 예: "100만 원 이하", "100~200만 원", "200만 원 이상"
+    m_low = re.search(r"([0-9]+)\s*만[^0-9]*이하", normalized)
+    if m_low:
+        mx = int(m_low.group(1))
+        return {"budget_type": "choice", "budget_choice": f"일시불(100만원 이하)", "budget_range_manwon": _range_dict(0, mx)}
+
+    m_high = re.search(r"([0-9]+)\s*만[^0-9]*이상", normalized)
+    if m_high:
+        mn = int(m_high.group(1))
+        return {"budget_type": "choice", "budget_choice": f"일시불({mn}만원 이상)", "budget_range_manwon": _range_dict(mn, None)}
+
+    m_range = re.search(r"([0-9]+)\s*[~\-]\s*([0-9]+)\s*만", normalized)
+    if m_range:
+        mn = int(m_range.group(1))
+        mx = int(m_range.group(2))
+        return {"budget_type": "choice", "budget_choice": f"일시불({mn}~{mx}만원)", "budget_range_manwon": _range_dict(mn, mx)}
+
+    # 새 UI 버튼값만 온 경우(btn1/btn2/btn3)
+    if lowered in {"btn1", "btn2", "btn3"}:
+        if lowered == "btn1":
+            return {"budget_type": "subscription", "budget_choice": "월 구독(범위 미입력)", "budget_range_manwon": {"min": None, "max": None}}
+        if lowered == "btn2":
+            return {"budget_type": "choice", "budget_choice": "일시불(범위 미입력)", "budget_range_manwon": {"min": None, "max": None}}
+        return {"budget_type": "choice", "budget_choice": "아직정하지않았어요", "budget_range_manwon": {"min": None, "max": None}}
+
     raise ValueError("invalid budget")
 
 # --- 노드 정의 ---
@@ -167,7 +304,11 @@ def node_chat_3_1(state: ChatState) -> ChatState:
 def node_chat_4(state: ChatState) -> ChatState:
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
-    user_info["lifestyle"] = user_text
+    # UI에서 "최대 2개 선택"이 list로 내려올 수 있어 문자열로 합칩니다.
+    if isinstance(user_text, list):
+        user_info["lifestyle"] = ", ".join(_to_str(x) for x in user_text)
+    else:
+        user_info["lifestyle"] = user_text
     return {**state, "step": ChatStep.CHAT_5, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
 
 def node_chat_5(state: ChatState) -> ChatState:
@@ -180,12 +321,47 @@ def node_chat_5(state: ChatState) -> ChatState:
     except ValueError:
         return {**state, "step": ChatStep.CHAT_5, "data": {"error": "예산을 다시 입력해주세요."}, "messages": _append_message(state, role="user", content=user_text)}
 
-def node_chat_6(state: ChatState) -> ChatState:
+async def node_chat_6(state: ChatState) -> ChatState:
+    # 새 단계 흐름(예시 VER3-1) 기준:
+    # CHAT_6 진단 완료 요청 시, 별도의 "추천 보기" 키워드 없이 바로 추천 생성으로 넘어갑니다.
     user_text = state.get("last_user_input")
-    s = _to_str(user_text)
-    if "추천" in s and ("보기" in s or "리스트" in s):
-        return {**state, "step": ChatStep.CHAT_RESULT, "messages": _append_message(state, role="user", content=user_text)}
-    return {**state, "step": ChatStep.CHAT_6, "messages": _append_message(state, role="user", content=user_text)}
+    if user_text is not None:
+        state = {**state, "messages": _append_message(state, role="user", content=user_text)}
+    return await node_chat_result(state)
+
+
+def node_chat_7(state: ChatState) -> ChatState:
+    """
+    배치 제안 보기 단계.
+
+    현재 레포에는 "도면/배치 시뮬레이션"을 수행하는 로직이 없으므로,
+    프론트가 전달한 선택값(user_text)을 세션(user_info)에 저장만 합니다.
+    """
+    user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+    if user_text is not None:
+        user_info["blueprint_request"] = user_text
+    return {**state, "step": ChatStep.CHAT_7, "user_info": user_info, "is_completed": True}
+
+
+async def node_chat_10(state: ChatState) -> ChatState:
+    """
+    다시 추천받기.
+    CHAT_10 입력은 내부적으로 추천 생성(CHAT_RESULT)을 재실행합니다.
+    """
+    user_text = state.get("last_user_input")
+    if user_text is not None:
+        state = {**state, "messages": _append_message(state, role="user", content=user_text)}
+    return await node_chat_result(state)
+
+
+def node_chat_11(state: ChatState) -> ChatState:
+    """
+    진단 종료 단계.
+    프론트에서 종료/저장 UI를 처리하므로 여기서는 종료 상태만 플래그로 남깁니다.
+    """
+    return {**state, "step": ChatStep.CHAT_11, "is_completed": True}
+
 
 async def node_chat_result(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
@@ -221,6 +397,27 @@ async def node_chat_result(state: ChatState) -> ChatState:
         if isinstance(item, dict):
             item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
             item.update(_compute_budget_breakdown(item))
+            # GUI-2 추천 카드 렌더 편의를 위해 제품을 가전/가구/소품으로 분리합니다.
+            products = item.get("products") or []
+            appliances: list[dict[str, Any]] = []
+            furniture: list[dict[str, Any]] = []
+            if isinstance(products, list):
+                for p in products:
+                    if not isinstance(p, dict):
+                        continue
+                    p_cat = p.get("category")
+                    if p_cat == "appliance":
+                        appliances.append(p)
+                    elif p_cat == "furniture":
+                        furniture.append(p)
+                    else:
+                        # category가 불명확한 경우, price_normal/price_subscription 존재를 기준으로 분류
+                        if "price_normal" in p or "price_subscription" in p:
+                            appliances.append(p)
+                        else:
+                            furniture.append(p)
+            item["appliances"] = appliances
+            item["furniture"] = furniture
 
     if full_recommendation_list:
         packages_payload: list[Dict[str, Any]] = []
@@ -378,12 +575,24 @@ async def node_rag_chat(state: ChatState) -> ChatState:
 
 def route_from_step(state: ChatState) -> str:
     requested = state.get("requested_step_code")
+    if isinstance(requested, str):
+        # 예시 문서 표기는 CHAT-7 처럼 하이픈이 올 수 있어, 프론트/문서 불일치를 방어합니다.
+        requested = requested.replace("-", "_").upper()
     step = ChatStep(requested) if requested and requested in ChatStep.__members__ else state.get("step", ChatStep.CHAT_0)
     mapping = {
-        ChatStep.CHAT_0: "chat_0", ChatStep.CHAT_1: "chat_1", ChatStep.CHAT_2: "chat_2",
-        ChatStep.CHAT_3: "chat_3", ChatStep.CHAT_3_1: "chat_3_1", ChatStep.CHAT_4: "chat_4",
-        ChatStep.CHAT_5: "chat_5", ChatStep.CHAT_6: "chat_6",
-        ChatStep.CHAT_RESULT: "chat_result", ChatStep.RAG_CHAT: "rag_chat"
+        ChatStep.CHAT_0: "chat_0",
+        ChatStep.CHAT_1: "chat_1",
+        ChatStep.CHAT_2: "chat_2",
+        ChatStep.CHAT_3: "chat_3",
+        ChatStep.CHAT_3_1: "chat_3_1",
+        ChatStep.CHAT_4: "chat_4",
+        ChatStep.CHAT_5: "chat_5",
+        ChatStep.CHAT_6: "chat_6",
+        ChatStep.CHAT_7: "chat_7",
+        ChatStep.CHAT_10: "chat_10",
+        ChatStep.CHAT_11: "chat_11",
+        ChatStep.CHAT_RESULT: "chat_result",
+        ChatStep.RAG_CHAT: "rag_chat",
     }
     return mapping.get(step, "chat_0")
 
@@ -393,6 +602,7 @@ def build_graph():
         "chat_0": node_chat_0, "chat_1": node_chat_1, "chat_2": node_chat_2,
         "chat_3": node_chat_3, "chat_3_1": node_chat_3_1, "chat_4": node_chat_4,
         "chat_5": node_chat_5, "chat_6": node_chat_6,
+        "chat_7": node_chat_7, "chat_10": node_chat_10, "chat_11": node_chat_11,
         "chat_result": node_chat_result, "rag_chat": node_rag_chat
     }
     for name, func in nodes.items():

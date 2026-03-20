@@ -77,8 +77,8 @@ def create_app() -> FastAPI:
         data = result.get("data", {}) or {}
         ai_response = result.get("ai_response")
 
-        # CHAT_0~CHAT_6 구간은 일반적으로 data가 비어있으므로,
-        # 프론트/스프링에서 성공 여부를 단순하게 처리할 수 있도록 message를 내려준다.
+        # CHAT_0~CHAT_5: 추천리스트 출력 전 단계는 보통 data가 비어있음.
+        # 프론트가 "저장 완료" 여부를 쉽게 판단할 수 있도록 메시지를 채워줍니다.
         if payload.step_code in {
             "CHAT_0",
             "CHAT_1",
@@ -87,10 +87,9 @@ def create_app() -> FastAPI:
             "CHAT_3_1",
             "CHAT_4",
             "CHAT_5",
-            "CHAT_6",
         }:
-            if isinstance(data, dict) and "error" not in data:
-                data = {"message": "성공적으로 저장되었습니다."}
+            if isinstance(data, dict) and not data and "error" not in data:
+                data = {"message": "저장 완료, 다음 단계로 진행해주세요."}
 
         return ChatResponse(data=data, ai_response=ai_response)
 
