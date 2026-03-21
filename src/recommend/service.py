@@ -6,12 +6,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session_maker
-from ..products_repo import Chat, Product, Recommendation
+from ..products_repo import Chat, ProductEntity, Recommendation
 from .algorithm import RecommendationResult, rerank_and_filter
 
 
 async def _fetch_candidate_products(*, limit: int = 200) -> list[dict[str, Any]]:
     """
+    product 테이블에서 추천 후보를 조회합니다.
+
     TODO: 실제로는 여기서
     - pgvector Top-K 검색(쿼리 임베딩 기반)
     - 또는 조건 필터링 + 벡터 검색
@@ -22,24 +24,42 @@ async def _fetch_candidate_products(*, limit: int = 200) -> list[dict[str, Any]]
         rows = (
             await session.execute(
                 select(
-                    Product.id,
-                    Product.name,
-                    Product.category,
-                    Product.brand,
-                    Product.description,
-                    Product.price,
+                    ProductEntity.product_id,
+                    ProductEntity.model_id,
+                    ProductEntity.product_name,
+                    ProductEntity.category,
+                    ProductEntity.product_category,
+                    ProductEntity.brand,
+                    ProductEntity.original_price,
+                    ProductEntity.discount_rate,
+                    ProductEntity.discount_price,
+                    ProductEntity.is_subscribe,
+                    ProductEntity.review_score,
+                    ProductEntity.review_cnt,
+                    ProductEntity.product_url,
+                    ProductEntity.product_image_url,
                 ).limit(limit)
             )
         ).all()
 
     return [
         {
-            "id": r.id,
-            "name": r.name,
+            "id": r.product_id,
+            "model_id": r.model_id,
+            "name": r.product_name,
             "category": r.category,
+            "product_category": r.product_category,
             "brand": r.brand,
-            "description": r.description,
-            "price": r.price,
+            # 추후 rerank_and_filter에서 일관되게 사용하도록 가격 우선순위를 정규화
+            "price": r.discount_price if r.discount_price is not None else r.original_price,
+            "original_price": r.original_price,
+            "discount_rate": r.discount_rate,
+            "discount_price": r.discount_price,
+            "is_subscribe": r.is_subscribe,
+            "review_score": r.review_score,
+            "review_cnt": r.review_cnt,
+            "url": r.product_url,
+            "image_url": r.product_image_url,
         }
         for r in rows
     ]

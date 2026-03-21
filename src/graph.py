@@ -396,6 +396,20 @@ async def node_chat_result(state: ChatState) -> ChatState:
     for item in full_recommendation_list:
         if isinstance(item, dict):
             item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
+            # 제품 키를 API 응답 표준(product_*)으로 정규화합니다.
+            normalized_products: list[dict[str, Any]] = []
+            raw_products = item.get("products") or []
+            if isinstance(raw_products, list):
+                for p in raw_products:
+                    if not isinstance(p, dict):
+                        continue
+                    normalized_products.append({
+                        **p,
+                        "product_name": p.get("product_name") or p.get("name") or "",
+                        "product_url": p.get("product_url") or p.get("url") or "",
+                        "product_image_url": p.get("product_image_url") or p.get("image_url") or "",
+                    })
+            item["products"] = normalized_products
             item.update(_compute_budget_breakdown(item))
             # GUI-2 추천 카드 렌더 편의를 위해 제품을 가전/가구/소품으로 분리합니다.
             products = item.get("products") or []
@@ -431,14 +445,14 @@ async def node_chat_result(state: ChatState) -> ChatState:
                     if not isinstance(p, dict): continue
                     simplified_products.append({
                         "category": p.get("category"),
-                        "name": p.get("name"),
+                        "product_name": p.get("product_name") or p.get("name"),
                         "model_id": p.get("model_id") or p.get("model"),
                         "brand": p.get("brand"),
                         "price_normal": p.get("price_normal"),
                         "price_subscription": p.get("price_subscription"),
                         "price": p.get("price"),
-                        "image_url": p.get("image_url"),
-                        "url": p.get("url"),
+                        "product_image_url": p.get("product_image_url") or p.get("image_url"),
+                        "product_url": p.get("product_url") or p.get("url"),
                     })
 
             packages_payload.append({
