@@ -7,9 +7,9 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
-from src.graph import chat_app, ChatState, ChatStep
+from src.graph import chat_app, ChatState
 from src.state_store import get_checkpointer
 
 from sqlalchemy import text
@@ -17,20 +17,27 @@ from src.db import get_engine  # 이미 있다면 패스!
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends
 
+
 class ChatRequest(BaseModel):
+    """snake_case(user_text) 또는 프론트 camelCase(userText) 모두 수용."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
     # 하나의 conv_id(문자열)로 채팅 세션을 식별
-    conv_id: str
+    conv_id: str = Field(alias="convId")
     # 프론트/스프링이 "현재 단계"를 들고 있고, FastAPI는 그 단계에 맞는 노드를 실행
     # (기존에는 FastAPI가 step_code를 응답으로 내려주며 다음 단계를 주도)
-    step_code: str
+    step_code: str = Field(alias="stepCode")
     # SpringBoot/프론트가 화면에 표시한 assistant 문구를 그대로 저장하고 싶을 때 전달
-    assistant_text: Optional[object] = None
-    user_text: Optional[object] = None
+    assistant_text: Optional[object] = Field(default=None, alias="assistantText")
+    user_text: Optional[object] = Field(default=None, alias="userText")
 
 
 class ChatResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     data: dict
-    ai_response: Optional[str] = None
+    ai_response: Optional[str] = Field(default=None, alias="aiResponse")
 
 
 def create_app() -> FastAPI:
@@ -47,7 +54,7 @@ def create_app() -> FastAPI:
     # checkpointer는 graph.compile 시 사용되므로 여기서는 생성만 보장(사이드이펙트 없음)
     _ = get_checkpointer()
 
-    @app.post("/ai/chat", response_model=ChatResponse)
+    @app.post("/ai/chat", response_model=ChatResponse, response_model_by_alias=True)
     async def chat_endpoint(payload: ChatRequest):
         if not payload.conv_id:
             raise HTTPException(status_code=400, detail="conv_id is required")
@@ -93,9 +100,6 @@ def create_app() -> FastAPI:
 
         return ChatResponse(data=data, ai_response=ai_response)
 
-
-
-
     # DB 세션을 가져오는 의존성 주입 함수 (만약 이미 src.db 등에 있다면 그걸 써도 돼!)
     async def get_db():
         engine = get_engine()
@@ -111,18 +115,17 @@ def create_app() -> FastAPI:
             # 안전하게 public.test_user라고 명시
             query = text("SELECT * FROM public.test_user")
             result = await db.execute(query)
-            
+
             # 조회 결과를 딕셔너리 리스트로 변환
             users = [dict(row) for row in result.mappings().all()]
-            
+
             return {
                 "status": "success",
                 "count": len(users),
-                "data": users
+                "data": users,
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"RDS 조회 실패: {str(e)}")
-
 
     @app.get("/health")
     async def health():
@@ -143,4 +146,3 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "8000")),
         reload=True,
     )
-
