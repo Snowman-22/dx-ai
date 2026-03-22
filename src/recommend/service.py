@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 from typing import Any, Optional, Sequence
 
 from sqlalchemy import select
@@ -10,7 +12,7 @@ from ..products_repo import Chat, ProductEntity, Recommendation
 from .algorithm import RecommendationResult, rerank_and_filter
 
 
-async def _fetch_candidate_products(*, limit: int = 200) -> list[dict[str, Any]]:
+async def fetch_candidate_products(*, limit: int = 200) -> list[dict[str, Any]]:
     """
     product 테이블에서 추천 후보를 조회합니다.
 
@@ -74,8 +76,15 @@ async def generate_recommendation_result(*, user_info: dict[str, Any]) -> Recomm
     2) Postgres에서 후보 상품을 벡터검색으로 Top-K 조회
     3) ipynb 알고리즘(rerank_and_filter)로 재랭킹/패키징
     """
-    candidates = await _fetch_candidate_products()
-    return rerank_and_filter(user_info=user_info, candidates=candidates)
+    candidates = await fetch_candidate_products()
+    # numpy/pandas 등 동기 알고리즘이 이벤트 루프를 막지 않도록 스레드에서 실행
+    return await asyncio.to_thread(
+        functools.partial(
+            rerank_and_filter,
+            user_info=user_info,
+            candidates=candidates,
+        )
+    )
 
 
 async def _get_or_create_chat(

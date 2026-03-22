@@ -13,26 +13,27 @@ from .product_details import fetch_products_bundle_details
 from .state_store import get_checkpointer
 from .prompt import (
     build_package_reason_prompt,
+    build_blueprint_rag_prompt,
     build_recommendation_prompt,
     build_rag_prompt,
     build_rag_prompt_with_package_context,
 )
 from .recommend import generate_recommendation_result
+from .recommend.service import fetch_candidate_products
 
 
 class ChatStep(str, Enum):
-    CHAT_0 = "CHAT_0"  # 진단 시작
-    CHAT_1 = "CHAT_1"  # 주거공간 크기(평수)
-    CHAT_2 = "CHAT_2"  # 보유/필요 가전
-    CHAT_3 = "CHAT_3"  # 가구/소품 추천 필요 여부
-    CHAT_3_1 = "CHAT_3_1"  # 인테리어 스타일
-    CHAT_4 = "CHAT_4"  # 라이프스타일
-    CHAT_5 = "CHAT_5"  # 예산
-    CHAT_6 = "CHAT_6"  # 진단 완료
-    CHAT_7 = "CHAT_7"  # 배치 제안 보기
-    CHAT_RESULT = "CHAT_RESULT"  # 추천 결과
-    RAG_CHAT = "RAG_CHAT"  # 추천 이후 자유대화
-    CHAT_10 = "CHAT_10"  # 다시 추천받기
+    # UI 순서: 예산 → 평수 → 라이프스타일 → 보유+필요 가전(한 단계) → 구매계획 → 추천
+    CHAT_0 = "CHAT_0"  # 진단 시작(인트로)
+    CHAT_1 = "CHAT_1"  # 총 예산(만원, 숫자)
+    CHAT_2 = "CHAT_2"  # 평수(칩/텍스트)
+    CHAT_3 = "CHAT_3"  # 라이프스타일(칩/텍스트)
+    CHAT_4 = "CHAT_4"  # 보유 + 필요(필수) 가전 — 한 요청(owned/needed)
+    CHAT_5 = "CHAT_5"  # 구매 계획(가구/가전 텍스트)
+    CHAT_6 = "CHAT_6"  # 추천 리스트 생성
+    CHAT_RESULT = "CHAT_RESULT"  # 추천 결과(내부 상태)
+    RECOMMEND_RAG = "RECOMMEND_RAG"  # 추천 이후 일반 질의(도면·배치 없음)
+    BLUEPRINT_RAG = "BLUEPRINT_RAG"  # 도면 단계: 선택 도면 + 패키지 + 스티커 좌표 RAG
     CHAT_11 = "CHAT_11"  # 진단 종료
 
 
@@ -116,6 +117,105 @@ def _append_message(state: ChatState, *, role: str, content: Any) -> List[Dict[s
     messages = list(state.get("messages") or [])
     messages.append({"role": role, "content": content})
     return messages
+
+
+def _normalize_name(s: Any) -> str:
+    return _to_str(s).lower().replace(" ", "")
+
+
+def _enforce_products_from_catalog(
+    products: Any,
+    *,
+    catalog_by_model_id: Dict[str, Dict[str, Any]],
+    catalog_by_name: Dict[str, Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    """
+    LLM fallback 결과를 DB 카탈로그 기준으로 보정합니다.
+    - model_id 우선 매칭, 없으면 product_name 매칭
+    - 카탈로그에 없는 항목은 제거(임의 상품 방지)
+    """
+    if not isinstance(products, list):
+        return []
+
+    out: list[Dict[str, Any]] = []
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        raw_mid = _to_str(p.get("model_id") or p.get("model"))
+        raw_name = _to_str(p.get("product_name") or p.get("name"))
+
+        matched: Optional[Dict[str, Any]] = None
+        if raw_mid and raw_mid in catalog_by_model_id:
+            matched = catalog_by_model_id[raw_mid]
+        elif raw_name:
+            key = _normalize_name(raw_name)
+            matched = catalog_by_name.get(key)
+
+        if matched is None:
+            continue
+
+        cat = p.get("category") or matched.get("category")
+        price = matched.get("price")
+        out.append({
+            "category": cat,
+            "product_name": matched.get("name"),
+            "model_id": matched.get("model_id") or "",
+            "brand": matched.get("brand"),
+            "price_normal": price if cat == "appliance" else 0,
+            "price_subscription": 0,
+            "price": price,
+            "product_image_url": matched.get("image_url") or "",
+            "product_url": matched.get("url") or "",
+        })
+    return out
+
+
+def _get_budget_max_won(user_info: Dict[str, Any]) -> Optional[int]:
+    """
+    user_info의 예산 정보를 원화 상한으로 변환합니다.
+    - budget_manwon: 숫자 입력(만원 단위)
+    - budget_range_manwon.max: 선택 범위 상한(만원 단위)
+    """
+    if user_info.get("budget_manwon") is not None:
+        return _to_int_price(user_info.get("budget_manwon")) * 10_000
+    rng = user_info.get("budget_range_manwon")
+    if isinstance(rng, dict):
+        mx = rng.get("max")
+        if mx is not None:
+            return _to_int_price(mx) * 10_000
+    return None
+
+
+def _product_price_won(p: Dict[str, Any]) -> int:
+    category = p.get("category")
+    if category == "appliance":
+        # 일시불 기준 예산 컷오프를 기본으로 적용
+        return _to_int_price(p.get("price_normal") or p.get("price"))
+    return _to_int_price(p.get("price"))
+
+
+def _apply_budget_cap_to_products(
+    products: list[Dict[str, Any]],
+    *,
+    budget_max_won: Optional[int],
+) -> list[Dict[str, Any]]:
+    if budget_max_won is None or budget_max_won <= 0:
+        return products
+
+    picked: list[Dict[str, Any]] = []
+    total = 0
+    # 카테고리 순서를 유지한 채 누적 컷오프로 예산 상한 적용
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        price = _product_price_won(p)
+        if price <= 0:
+            continue
+        if total + price <= budget_max_won:
+            picked.append(p)
+            total += price
+    # 상한이 너무 타이트해서 아무것도 못 담는 경우, 원본을 유지해 빈 패키지 방지
+    return picked or products
 
 def _parse_budget(user_text: Any) -> Dict[str, Any]:
     """
@@ -267,88 +367,130 @@ def _parse_budget(user_text: Any) -> Dict[str, Any]:
 
     raise ValueError("invalid budget")
 
+
+def _extract_owned_list(user_text: Any) -> List[str]:
+    if isinstance(user_text, dict):
+        raw = user_text.get("owned")
+        if isinstance(raw, list):
+            return [_to_str(x) for x in raw if _to_str(x)]
+        return []
+    if isinstance(user_text, list):
+        return [_to_str(x) for x in user_text if _to_str(x)]
+    s = _to_str(user_text)
+    if not s:
+        return []
+    if "," in s:
+        return [x.strip() for x in s.split(",") if x.strip()]
+    return [s]
+
+
+def _extract_needed_list(user_text: Any) -> List[str]:
+    if isinstance(user_text, dict):
+        raw = user_text.get("needed")
+        if raw is None:
+            raw = user_text.get("required") or user_text.get("essential")
+        if isinstance(raw, list):
+            return [_to_str(x) for x in raw if _to_str(x)]
+        return []
+    if isinstance(user_text, list):
+        return [_to_str(x) for x in user_text if _to_str(x)]
+    s = _to_str(user_text)
+    if not s:
+        return []
+    if "," in s:
+        return [x.strip() for x in s.split(",") if x.strip()]
+    return [s]
+
+
+def _dict_has_needed_key(d: dict) -> bool:
+    return any(
+        k in d
+        for k in ("needed", "required", "essential", "requiredAppliances", "essentialAppliances")
+    )
+
+
+def _get_needed_raw_from_dict(d: dict) -> Any:
+    if "needed" in d:
+        return d.get("needed")
+    if "required" in d:
+        return d.get("required")
+    if "requiredAppliances" in d:
+        return d.get("requiredAppliances")
+    if "essentialAppliances" in d:
+        return d.get("essentialAppliances")
+    if "essential" in d:
+        return d.get("essential")
+    return None
+
+
 # --- 노드 정의 ---
 
 def node_chat_0(state: ChatState) -> ChatState:
     return {**state, "step": ChatStep.CHAT_1, "data": {}, "is_completed": False}
 
+
 def node_chat_1(state: ChatState) -> ChatState:
-    user_text = state.get("last_user_input")
-    user_info = dict(state.get("user_info") or {})
-    user_info["size"] = user_text
-    return {**state, "step": ChatStep.CHAT_2, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
-
-def node_chat_2(state: ChatState) -> ChatState:
-    user_text = state.get("last_user_input")
-    user_info = dict(state.get("user_info") or {})
-    owned = user_text.get("owned", []) if isinstance(user_text, dict) else (user_text if isinstance(user_text, list) else [])
-    needed = user_text.get("needed", []) if isinstance(user_text, dict) else []
-    user_info["owned_appliances"], user_info["needed_appliances"] = owned, needed
-    return {**state, "step": ChatStep.CHAT_3, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
-
-def node_chat_3(state: ChatState) -> ChatState:
-    user_text = state.get("last_user_input")
-    user_info = dict(state.get("user_info") or {})
-    s = _to_str(user_text)
-    need_furniture = False if "없" in s else True
-    user_info["need_furniture"] = need_furniture
-    next_step = ChatStep.CHAT_3_1 if need_furniture else ChatStep.CHAT_4
-    return {**state, "step": next_step, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
-
-def node_chat_3_1(state: ChatState) -> ChatState:
-    user_text = state.get("last_user_input")
-    user_info = dict(state.get("user_info") or {})
-    user_info["interior_style"] = user_text
-    return {**state, "step": ChatStep.CHAT_4, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
-
-def node_chat_4(state: ChatState) -> ChatState:
-    user_text = state.get("last_user_input")
-    user_info = dict(state.get("user_info") or {})
-    # UI에서 "최대 2개 선택"이 list로 내려올 수 있어 문자열로 합칩니다.
-    if isinstance(user_text, list):
-        user_info["lifestyle"] = ", ".join(_to_str(x) for x in user_text)
-    else:
-        user_info["lifestyle"] = user_text
-    return {**state, "step": ChatStep.CHAT_5, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
-
-def node_chat_5(state: ChatState) -> ChatState:
+    """CHAT_1: 총 예산(만원, 숫자 등) — UI 첫 입력."""
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
     try:
         parsed = _parse_budget(user_text)
         user_info.update(parsed)
-        return {**state, "step": ChatStep.CHAT_6, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+        return {**state, "step": ChatStep.CHAT_2, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
     except ValueError:
-        return {**state, "step": ChatStep.CHAT_5, "data": {"error": "예산을 다시 입력해주세요."}, "messages": _append_message(state, role="user", content=user_text)}
-
-async def node_chat_6(state: ChatState) -> ChatState:
-    # 새 단계 흐름(예시 VER3-1) 기준:
-    # CHAT_6 진단 완료 요청 시, 별도의 "추천 보기" 키워드 없이 바로 추천 생성으로 넘어갑니다.
-    user_text = state.get("last_user_input")
-    if user_text is not None:
-        state = {**state, "messages": _append_message(state, role="user", content=user_text)}
-    return await node_chat_result(state)
+        return {**state, "step": ChatStep.CHAT_1, "data": {"error": "예산을 다시 입력해주세요."}, "messages": _append_message(state, role="user", content=user_text)}
 
 
-def node_chat_7(state: ChatState) -> ChatState:
-    """
-    배치 제안 보기 단계.
-
-    현재 레포에는 "도면/배치 시뮬레이션"을 수행하는 로직이 없으므로,
-    프론트가 전달한 선택값(user_text)을 세션(user_info)에 저장만 합니다.
-    """
+def node_chat_2(state: ChatState) -> ChatState:
+    """CHAT_2: 평수 (10평 이하 / 10~20평 … 또는 텍스트)."""
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
-    if user_text is not None:
-        user_info["blueprint_request"] = user_text
-    return {**state, "step": ChatStep.CHAT_7, "user_info": user_info, "is_completed": True}
+    user_info["size"] = user_text
+    return {**state, "step": ChatStep.CHAT_3, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
 
 
-async def node_chat_10(state: ChatState) -> ChatState:
-    """
-    다시 추천받기.
-    CHAT_10 입력은 내부적으로 추천 생성(CHAT_RESULT)을 재실행합니다.
-    """
+def node_chat_3(state: ChatState) -> ChatState:
+    """CHAT_3: 라이프스타일 (칩 다중 선택 시 list 가능)."""
+    user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+    if isinstance(user_text, list):
+        user_info["lifestyle"] = ", ".join(_to_str(x) for x in user_text)
+    else:
+        user_info["lifestyle"] = user_text
+    return {**state, "step": ChatStep.CHAT_4, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+
+
+def node_chat_4(state: ChatState) -> ChatState:
+    """CHAT_4: 보유 + 필요(필수) 가전 — owned / needed 를 한 요청에."""
+    user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+    if isinstance(user_text, dict):
+        if "owned" in user_text:
+            user_info["owned_appliances"] = _extract_owned_list({"owned": user_text.get("owned")})
+        if _dict_has_needed_key(user_text):
+            user_info["needed_appliances"] = _extract_needed_list(
+                {"needed": _get_needed_raw_from_dict(user_text)}
+            )
+    else:
+        user_info["needed_appliances"] = _extract_needed_list(user_text)
+    return {**state, "step": ChatStep.CHAT_5, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+
+
+def node_chat_5(state: ChatState) -> ChatState:
+    """CHAT_5: 새 공간용 구매 계획(가구/가전) 자유 텍스트."""
+    user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+    if isinstance(user_text, list):
+        user_info["purchase_plans"] = ", ".join(_to_str(x) for x in user_text)
+    else:
+        user_info["purchase_plans"] = user_text
+    if _to_str(user_info.get("purchase_plans")):
+        user_info["need_furniture"] = True
+    return {**state, "step": ChatStep.CHAT_6, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+
+
+async def node_chat_6(state: ChatState) -> ChatState:
+    """CHAT_6: 추천 리스트 생성."""
     user_text = state.get("last_user_input")
     if user_text is not None:
         state = {**state, "messages": _append_message(state, role="user", content=user_text)}
@@ -366,6 +508,8 @@ def node_chat_11(state: ChatState) -> ChatState:
 async def node_chat_result(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
     messages = list(state.get("messages") or [])
+    candidate_products: list[dict[str, Any]] = []
+    budget_max_won = _get_budget_max_won(user_info)
 
     try:
         result = await generate_recommendation_result(user_info=user_info)
@@ -384,7 +528,8 @@ async def node_chat_result(state: ChatState) -> ChatState:
             })
         total_estimated_budget = result.total_estimated_budget
     except NotImplementedError:
-        prompt = build_recommendation_prompt(user_info)
+        candidate_products = await fetch_candidate_products(limit=300)
+        prompt = build_recommendation_prompt(user_info, candidate_products=candidate_products)
         resp = await llm_json.ainvoke(prompt) # 비동기 환경이므로 ainvoke 추천
         content_json = _extract_json_from_llm_response(resp)
         full_recommendation_list = content_json.get("recommendation_list") or content_json.get("data") or []
@@ -393,23 +538,50 @@ async def node_chat_result(state: ChatState) -> ChatState:
     if not isinstance(full_recommendation_list, list):
         full_recommendation_list = []
 
+    catalog_by_model_id: Dict[str, Dict[str, Any]] = {}
+    catalog_by_name: Dict[str, Dict[str, Any]] = {}
+    if candidate_products:
+        for c in candidate_products:
+            if not isinstance(c, dict):
+                continue
+            mid = _to_str(c.get("model_id"))
+            nm = _normalize_name(c.get("name"))
+            if mid:
+                catalog_by_model_id[mid] = c
+            if nm:
+                catalog_by_name[nm] = c
+
     for item in full_recommendation_list:
         if isinstance(item, dict):
             item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
-            # 제품 키를 API 응답 표준(product_*)으로 정규화합니다.
-            normalized_products: list[dict[str, Any]] = []
             raw_products = item.get("products") or []
-            if isinstance(raw_products, list):
-                for p in raw_products:
-                    if not isinstance(p, dict):
-                        continue
-                    normalized_products.append({
-                        **p,
-                        "product_name": p.get("product_name") or p.get("name") or "",
-                        "product_url": p.get("product_url") or p.get("url") or "",
-                        "product_image_url": p.get("product_image_url") or p.get("image_url") or "",
-                    })
-            item["products"] = normalized_products
+            if catalog_by_model_id or catalog_by_name:
+                item["products"] = _enforce_products_from_catalog(
+                    raw_products,
+                    catalog_by_model_id=catalog_by_model_id,
+                    catalog_by_name=catalog_by_name,
+                )
+            else:
+                # 추천 알고리즘 경로(향후 구현) 또는 카탈로그 미사용 시 기존 정규화
+                normalized_products: list[dict[str, Any]] = []
+                if isinstance(raw_products, list):
+                    for p in raw_products:
+                        if not isinstance(p, dict):
+                            continue
+                        normalized_products.append({
+                            **p,
+                            "product_name": p.get("product_name") or p.get("name") or "",
+                            "product_url": p.get("product_url") or p.get("url") or "",
+                            "product_image_url": p.get("product_image_url") or p.get("image_url") or "",
+                        })
+                item["products"] = normalized_products
+
+            # 예산 상한(일시불 기준) 적용: 패키지 총액이 상한을 넘지 않도록 제품 컷오프
+            if isinstance(item.get("products"), list):
+                item["products"] = _apply_budget_cap_to_products(
+                    item["products"],
+                    budget_max_won=budget_max_won,
+                )
             item.update(_compute_budget_breakdown(item))
             # GUI-2 추천 카드 렌더 편의를 위해 제품을 가전/가구/소품으로 분리합니다.
             products = item.get("products") or []
@@ -504,11 +676,296 @@ async def node_chat_result(state: ChatState) -> ChatState:
         "is_completed": True,
     }
 
+
+def _parse_recommend_rag_user_input(user_text: Any) -> tuple[str, Optional[int]]:
+    """
+    RECOMMEND_RAG용 userText — 질문 + (선택) 패키지 인덱스만.
+    도면·배치(floorPlanId, placements 등)는 무시합니다. → BLUEPRINT_RAG 단계에서 처리.
+    """
+    if isinstance(user_text, dict):
+        q = (
+            _to_str(user_text.get("message"))
+            or _to_str(user_text.get("question"))
+            or _to_str(user_text.get("text"))
+        )
+        pkg_idx: Optional[int] = None
+        raw_pi = user_text.get("packageIndex")
+        if raw_pi is None:
+            raw_pi = user_text.get("package_index")
+        if raw_pi is not None and raw_pi != "":
+            try:
+                pkg_idx = int(raw_pi)
+            except (TypeError, ValueError):
+                pkg_idx = None
+        return q, pkg_idx
+    return _to_str(user_text), None
+
+
+def _parse_placement_payload(user_text: Any) -> Dict[str, Any]:
+    """도면 배치 화면에서 보내는 userText(dict) 정규화. camelCase/snake_case 모두."""
+    if not isinstance(user_text, dict):
+        return {}
+    out = dict(user_text)
+    if "floor_plan_id" not in out and user_text.get("floorPlanId"):
+        out["floor_plan_id"] = user_text.get("floorPlanId")
+    if "package_index" not in out and user_text.get("packageIndex") is not None:
+        out["package_index"] = user_text.get("packageIndex")
+    if "floor_plan_image_url" not in out and user_text.get("floorPlanImageUrl"):
+        out["floor_plan_image_url"] = user_text.get("floorPlanImageUrl")
+    if "canvas_size" not in out and user_text.get("canvasSize"):
+        out["canvas_size"] = user_text.get("canvasSize")
+    return out
+
+
+async def _execute_floor_plan_package_rag(
+    state: ChatState,
+    *,
+    result_step: ChatStep,
+    response_key: str,
+    assistant_type: str,
+) -> ChatState:
+    """
+    도면 ID + 선택 패키지 인덱스 + 스티커(placements/utilities) + DB 제품 상세로 배치 적합성 RAG.
+    """
+    user_info = dict(state.get("user_info") or {})
+    new_data = dict(state.get("data") or {})
+    raw = state.get("last_user_input")
+    payload = _parse_placement_payload(raw)
+
+    floor_plan_id = _to_str(payload.get("floor_plan_id"))
+    pkg_idx_raw = payload.get("package_index")
+    try:
+        package_index = int(pkg_idx_raw) if pkg_idx_raw is not None else -1
+    except (TypeError, ValueError):
+        package_index = -1
+
+    placements = payload.get("placements")
+    if not isinstance(placements, list):
+        placements = []
+    utilities = payload.get("utilities")
+    if not isinstance(utilities, list):
+        utilities = []
+
+    all_recs = new_data.get("all_recommendations") or []
+    if not isinstance(all_recs, list) or not all_recs:
+        err = "추천 패키지가 없습니다. 같은 convId로 CHAT_6(추천 리스트)를 먼저 완료해 주세요."
+        return {
+            **state,
+            "step": result_step,
+            "data": {**new_data, "error": err},
+            "ai_response": None,
+            "is_completed": True,
+        }
+
+    if not floor_plan_id:
+        return {
+            **state,
+            "step": result_step,
+            "data": {**new_data, "error": "floor_plan_id(또는 floorPlanId)가 필요합니다."},
+            "ai_response": None,
+            "is_completed": True,
+        }
+
+    if package_index < 0 or package_index >= len(all_recs):
+        return {
+            **state,
+            "step": result_step,
+            "data": {
+                **new_data,
+                "error": f"package_index는 0~{len(all_recs) - 1} 범위여야 합니다.",
+            },
+            "ai_response": None,
+            "is_completed": True,
+        }
+
+    pkg = all_recs[package_index]
+    if not isinstance(pkg, dict):
+        return {
+            **state,
+            "step": result_step,
+            "data": {**new_data, "error": "선택한 패키지 데이터 형식이 올바르지 않습니다."},
+            "ai_response": None,
+            "is_completed": True,
+        }
+
+    user_info["selected_floor_plan_id"] = floor_plan_id
+    user_info["selected_package_index"] = package_index
+    user_info["last_placement_payload"] = payload
+
+    model_ids: List[str] = []
+    products = pkg.get("products") or []
+    if isinstance(products, list):
+        for p in products:
+            if isinstance(p, dict):
+                mid = p.get("model_id")
+                if mid:
+                    model_ids.append(str(mid))
+
+    products_details: Dict[str, Any] = {"products": []}
+    if model_ids:
+        try:
+            session_maker = get_session_maker()
+            async with session_maker() as session:
+                products_details = await fetch_products_bundle_details(session, model_ids=model_ids)
+        except Exception:
+            products_details = {"products": []}
+
+    floor_plan_ctx: Dict[str, Any] = {
+        "floor_plan_id": floor_plan_id,
+        "floor_plan_image_url": payload.get("floor_plan_image_url"),
+        "canvas_size": payload.get("canvas_size"),
+        "placements": placements,
+        "utilities": utilities,
+        "extra_note": payload.get("note") or payload.get("userNote"),
+    }
+
+    messages = _append_message(state, role="user", content=raw)
+    prompt = build_blueprint_rag_prompt(
+        user_info,
+        floor_plan=floor_plan_ctx,
+        selected_package=pkg,
+        products_details=products_details,
+    )
+    resp = await llm_json.ainvoke(prompt)
+    data_json = _extract_json_from_llm_response(resp)
+    answer_text = _to_str(data_json.get("answer"))
+
+    block = {
+        "floor_plan_id": floor_plan_id,
+        "package_index": package_index,
+        "package_name": pkg.get("name") or pkg.get("package_name"),
+        "llm": data_json,
+    }
+    new_data[response_key] = block
+
+    messages.append({"role": "assistant", "content": {"type": assistant_type, **block}})
+    return {
+        **state,
+        "step": result_step,
+        "user_info": user_info,
+        "ai_response": answer_text or None,
+        "messages": messages,
+        "data": new_data,
+        "is_completed": True,
+    }
+
+
+async def node_blueprint_rag(state: ChatState) -> ChatState:
+    """도면 단계: 선택 도면 + 패키지 + 스티커 좌표 RAG."""
+    return await _execute_floor_plan_package_rag(
+        state,
+        result_step=ChatStep.BLUEPRINT_RAG,
+        response_key="blueprint_rag",
+        assistant_type="blueprint_rag",
+    )
+
+
+def _detect_next_recommendation_page_intent(text: str) -> bool:
+    """
+    Spring이 보관한 전체 추천 목록의 '다음 3개'로 넘길 의도인지 키워드로 보조 판별.
+    LLM 플래그와 OR 로 사용.
+    """
+    t = _to_str(text).replace(" ", "").lower()
+    if not t:
+        return False
+    keys = (
+        "더보여", "더보여줘", "다시보여", "다시보여줘", "다시추천", "추천다시",
+        "다른걸", "다른거", "다른패키지", "다른조합", "다음추천", "다음패키지",
+        "추천더", "다시추천해", "다른걸추천", "패키지더",
+    )
+    return any(k in t for k in keys)
+
+
+def _norm_match_text(s: str) -> str:
+    return _to_str(s).lower().replace(" ", "").replace("\n", "").replace("\t", "")
+
+
+def _score_product_name_vs_question(product_name: str, question: str) -> int:
+    """질문과 추천 상품명 유사도(간단 휴리스틱)."""
+    pn = _norm_match_text(product_name)
+    qn = _norm_match_text(question)
+    if not pn or not qn:
+        return 0
+    if pn in qn:
+        return 1000 + len(pn)
+    if qn in pn:
+        return 500 + len(qn)
+    score = 0
+    for L in range(min(len(pn), 40), 2, -1):
+        for i in range(len(pn) - L + 1):
+            sub = pn[i : i + L]
+            if len(sub) >= 3 and sub in qn:
+                score = max(score, L * 15)
+    for tok in _to_str(product_name).split():
+        t = _norm_match_text(tok)
+        if len(t) >= 2 and t in qn:
+            score = max(score, len(t) * 20)
+    return score
+
+
+def _find_model_ids_by_product_name(
+    question: str,
+    all_recs: Any,
+    *,
+    max_models: int = 5,
+) -> tuple[List[str], Optional[int]]:
+    """
+    all_recommendations 안의 product_name/name과 질문을 매칭해 model_id 목록.
+    Returns (model_ids, 대표 패키지 인덱스 또는 None).
+    """
+    if not isinstance(all_recs, list) or not _to_str(question).strip():
+        return [], None
+
+    qn_flat = _norm_match_text(question)
+    candidates: list[tuple[int, int, str, str]] = []  # score, pkg_idx, model_id, name
+
+    for pi, pkg in enumerate(all_recs):
+        if not isinstance(pkg, dict):
+            continue
+        products = pkg.get("products") or []
+        if not isinstance(products, list):
+            continue
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            mid = _to_str(p.get("model_id"))
+            if not mid:
+                continue
+            pname = _to_str(p.get("product_name") or p.get("name"))
+            sc = _score_product_name_vs_question(pname, question) if pname else 0
+            if mid.lower() in qn_flat or mid in question:
+                sc = max(sc, 900 + len(mid))
+            if sc > 0:
+                candidates.append((sc, pi, mid, pname))
+
+    if not candidates:
+        return [], None
+
+    candidates.sort(key=lambda x: -x[0])
+    best = candidates[0][0]
+    threshold = max(30, int(best * 0.35))
+
+    out_ids: list[str] = []
+    seen: set[str] = set()
+    first_pkg: Optional[int] = None
+    for sc, pi, mid, _ in candidates:
+        if sc >= threshold and mid not in seen:
+            seen.add(mid)
+            out_ids.append(mid)
+            if first_pkg is None:
+                first_pkg = pi
+            if len(out_ids) >= max_models:
+                break
+
+    return out_ids, first_pkg
+
+
 # ⭐ 수정 포인트: async def 로 변경
-async def node_rag_chat(state: ChatState) -> ChatState:
+async def node_recommend_rag(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
-    user_text = state.get("last_user_input") or ""
-    messages = _append_message(state, role="user", content=user_text)
+    raw_user = state.get("last_user_input") or ""
+    question_str, explicit_pkg_idx = _parse_recommend_rag_user_input(raw_user)
+    messages = _append_message(state, role="user", content=raw_user)
     new_data = dict(state.get("data") or {})
 
     def _extract_package_index(text: str) -> Optional[int]:
@@ -521,8 +978,16 @@ async def node_rag_chat(state: ChatState) -> ChatState:
         if "세" in text: return 2
         return None
 
+    package_idx: Optional[int] = explicit_pkg_idx
+    if package_idx is None:
+        package_idx = _extract_package_index(_to_str(question_str))
+    if package_idx is None and user_info.get("selected_package_index") is not None:
+        try:
+            package_idx = int(user_info["selected_package_index"])
+        except (TypeError, ValueError):
+            package_idx = None
+
     prompt = None
-    package_idx = _extract_package_index(_to_str(user_text))
     if package_idx is not None:
         all_recs = new_data.get("all_recommendations") or []
         if isinstance(all_recs, list) and 0 <= package_idx < len(all_recs):
@@ -538,7 +1003,6 @@ async def node_rag_chat(state: ChatState) -> ChatState:
                 if model_ids:
                     try:
                         session_maker = get_session_maker()
-                        # 이제 async def 안이므로 정상 작동합니다!
                         async with session_maker() as session:
                             details = await fetch_products_bundle_details(
                                 session, model_ids=model_ids
@@ -553,34 +1017,71 @@ async def node_rag_chat(state: ChatState) -> ChatState:
                             "products_details": details,
                         }
                         prompt = build_rag_prompt_with_package_context(
-                            user_info, _to_str(user_text), package_context=package_context
+                            user_info,
+                            question_str,
+                            package_context=package_context,
                         )
                     except Exception:
                         prompt = None
 
+    # 패키지 인덱스 없이 질문에 상품명이 있으면 all_recommendations에서 매칭 → DB 스펙
     if prompt is None:
-        prompt = build_rag_prompt(user_info, user_text)
+        all_recs = new_data.get("all_recommendations") or []
+        mids_name, pkg_by_name = _find_model_ids_by_product_name(question_str, all_recs)
+        if mids_name:
+            try:
+                session_maker = get_session_maker()
+                async with session_maker() as session:
+                    details = await fetch_products_bundle_details(
+                        session, model_ids=mids_name
+                    )
+                pkg_slice: Dict[str, Any] = {}
+                if (
+                    pkg_by_name is not None
+                    and isinstance(all_recs, list)
+                    and 0 <= pkg_by_name < len(all_recs)
+                ):
+                    p0 = all_recs[pkg_by_name]
+                    if isinstance(p0, dict):
+                        pkg_slice = p0
+                package_context = {
+                    "package_index": pkg_by_name,
+                    "matched_by": "product_name",
+                    "package_budgets": {
+                        "appliance_price_normal_sum": pkg_slice.get("appliance_price_normal_sum"),
+                        "appliance_price_subscription_sum": pkg_slice.get(
+                            "appliance_price_subscription_sum"
+                        ),
+                        "furniture_price_sum": pkg_slice.get("furniture_price_sum"),
+                    },
+                    "products_details": details,
+                }
+                prompt = build_rag_prompt_with_package_context(
+                    user_info,
+                    question_str,
+                    package_context=package_context,
+                )
+            except Exception:
+                prompt = None
+
+    if prompt is None:
+        prompt = build_rag_prompt(user_info, question_str)
 
     resp = await llm_json.ainvoke(prompt)
     data_json = _extract_json_from_llm_response(resp)
-    request_more = bool(data_json.get("request_more_packages"))
     answer_text = data_json.get("answer", "")
+    show_next = bool(data_json.get("show_next_recommendation_page"))
+    if not show_next:
+        show_next = _detect_next_recommendation_page_intent(_to_str(question_str))
 
-    if request_more:
-        all_recs = new_data.get("all_recommendations") or []
-        next_index = int(new_data.get("next_index", 0))
-        if next_index >= len(all_recs):
-            new_data["display_recommendations"] = []
-            new_data["error"] = "모든 패키지 조합을 보여드렸습니다."
-        else:
-            batch = all_recs[next_index : next_index + 3]
-            new_data["display_recommendations"] = batch
-            new_data["next_index"] = next_index + len(batch)
+    new_data["show_next_recommendation_page"] = show_next
+    # Spring/프론트 편의 (동일 의미)
+    new_data["showNextRecommendationPage"] = show_next
 
     messages.append({"role": "assistant", "content": answer_text})
     return {
         **state,
-        "step": ChatStep.RAG_CHAT,
+        "step": ChatStep.RECOMMEND_RAG,
         "ai_response": answer_text,
         "messages": messages,
         "data": new_data,
@@ -590,7 +1091,7 @@ async def node_rag_chat(state: ChatState) -> ChatState:
 def route_from_step(state: ChatState) -> str:
     requested = state.get("requested_step_code")
     if isinstance(requested, str):
-        # 예시 문서 표기는 CHAT-7 처럼 하이픈이 올 수 있어, 프론트/문서 불일치를 방어합니다.
+        # 예시 문서 표기는 CHAT-6 처럼 하이픈이 올 수 있어, 프론트/문서 불일치를 방어합니다.
         requested = requested.replace("-", "_").upper()
     step = ChatStep(requested) if requested and requested in ChatStep.__members__ else state.get("step", ChatStep.CHAT_0)
     mapping = {
@@ -598,15 +1099,13 @@ def route_from_step(state: ChatState) -> str:
         ChatStep.CHAT_1: "chat_1",
         ChatStep.CHAT_2: "chat_2",
         ChatStep.CHAT_3: "chat_3",
-        ChatStep.CHAT_3_1: "chat_3_1",
         ChatStep.CHAT_4: "chat_4",
         ChatStep.CHAT_5: "chat_5",
         ChatStep.CHAT_6: "chat_6",
-        ChatStep.CHAT_7: "chat_7",
-        ChatStep.CHAT_10: "chat_10",
         ChatStep.CHAT_11: "chat_11",
         ChatStep.CHAT_RESULT: "chat_result",
-        ChatStep.RAG_CHAT: "rag_chat",
+        ChatStep.RECOMMEND_RAG: "recommend_rag",
+        ChatStep.BLUEPRINT_RAG: "blueprint_rag",
     }
     return mapping.get(step, "chat_0")
 
@@ -614,10 +1113,12 @@ def build_graph():
     workflow = StateGraph(ChatState)
     nodes = {
         "chat_0": node_chat_0, "chat_1": node_chat_1, "chat_2": node_chat_2,
-        "chat_3": node_chat_3, "chat_3_1": node_chat_3_1, "chat_4": node_chat_4,
+        "chat_3": node_chat_3, "chat_4": node_chat_4,
         "chat_5": node_chat_5, "chat_6": node_chat_6,
-        "chat_7": node_chat_7, "chat_10": node_chat_10, "chat_11": node_chat_11,
-        "chat_result": node_chat_result, "rag_chat": node_rag_chat
+        "chat_11": node_chat_11,
+        "chat_result": node_chat_result,
+        "recommend_rag": node_recommend_rag,
+        "blueprint_rag": node_blueprint_rag,
     }
     for name, func in nodes.items():
         workflow.add_node(name, func)

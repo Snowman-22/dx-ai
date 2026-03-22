@@ -14,3 +14,10 @@ sqlalchemy>=2.0.30
 asyncpg>=0.29.0
 greenlet>=3.0.3
 pgvector>=0.3.2
+
+# 추천 알고리즘 / ML
+numpy>=1.24.0
+pandas>=2.0.0
+psycopg2-binary>=2.9.9
+sentence-transformers>=2.2.0
+scikit-learn>=1.3.0

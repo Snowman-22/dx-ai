@@ -84,14 +84,13 @@ def create_app() -> FastAPI:
         data = result.get("data", {}) or {}
         ai_response = result.get("ai_response")
 
-        # CHAT_0~CHAT_5: 추천리스트 출력 전 단계는 보통 data가 비어있음.
+        # CHAT_0~CHAT_5: 추천(CHAT_6) 전까지는 보통 data가 비어 있음.
         # 프론트가 "저장 완료" 여부를 쉽게 판단할 수 있도록 메시지를 채워줍니다.
         if payload.step_code in {
             "CHAT_0",
             "CHAT_1",
             "CHAT_2",
             "CHAT_3",
-            "CHAT_3_1",
             "CHAT_4",
             "CHAT_5",
         }:
