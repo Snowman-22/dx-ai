@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, TypedDict
@@ -17,6 +19,9 @@ from .prompt import (
     build_rag_prompt_with_package_context,
 )
 from .recommend import generate_recommendation_result
+from .recommend.service import fetch_recommendation_catalog_maps
+
+logger = logging.getLogger(__name__)
 
 
 class ChatStep(str, Enum):
@@ -125,11 +130,13 @@ def _enforce_products_from_catalog(
     *,
     catalog_by_model_id: Dict[str, Dict[str, Any]],
     catalog_by_name: Dict[str, Dict[str, Any]],
+    catalog_by_product_id: Optional[Dict[int, Dict[str, Any]]] = None,
+    strict: bool = False,
 ) -> list[Dict[str, Any]]:
     """
-    LLM fallback 결과를 DB 카탈로그 기준으로 보정합니다.
-    - model_id 우선 매칭, 없으면 product_name 매칭
-    - 카탈로그에 없는 항목은 제거(임의 상품 방지)
+    DB 카탈로그에 있는 상품만 남기고, 필드는 RDS 스냅샷으로 통일합니다.
+    - strict=True: product_id 또는 model_id 로만 매칭 (이름만 있는 가짜 상품 제거)
+    - strict=False: model_id → 이름 정규화 매칭 (레거시)
     """
     if not isinstance(products, list):
         return []
@@ -142,18 +149,37 @@ def _enforce_products_from_catalog(
         raw_name = _to_str(p.get("product_name") or p.get("name"))
 
         matched: Optional[Dict[str, Any]] = None
-        if raw_mid and raw_mid in catalog_by_model_id:
+        if catalog_by_product_id:
+            try:
+                raw_pid = p.get("product_id")
+                pid = int(raw_pid) if raw_pid is not None and str(raw_pid).strip() != "" else None
+            except (TypeError, ValueError):
+                pid = None
+            if pid is not None and pid in catalog_by_product_id:
+                matched = catalog_by_product_id[pid]
+        if matched is None and raw_mid and raw_mid in catalog_by_model_id:
             matched = catalog_by_model_id[raw_mid]
-        elif raw_name:
+        if matched is None and not strict and raw_name:
             key = _normalize_name(raw_name)
             matched = catalog_by_name.get(key)
 
         if matched is None:
             continue
 
-        cat = p.get("category") or matched.get("category")
+        cat_hint = p.get("category")
+        if cat_hint in ("appliance", "furniture"):
+            cat = cat_hint
+        else:
+            db_cat = _to_str(matched.get("category")).upper()
+            if db_cat == "APPLIANCE":
+                cat = "appliance"
+            elif db_cat == "FURNITURE":
+                cat = "furniture"
+            else:
+                cat = "appliance"
         price = matched.get("price")
         out.append({
+            "product_id": matched.get("id"),
             "category": cat,
             "product_name": matched.get("name"),
             "model_id": matched.get("model_id") or "",
@@ -530,7 +556,6 @@ def node_chat_11(state: ChatState) -> ChatState:
 async def node_chat_result(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
     messages = list(state.get("messages") or [])
-    candidate_products: list[dict[str, Any]] = []
     budget_max_won = _get_budget_max_won(user_info)
 
     try:
@@ -575,44 +600,22 @@ async def node_chat_result(state: ChatState) -> ChatState:
     if not isinstance(full_recommendation_list, list):
         full_recommendation_list = []
 
-    catalog_by_model_id: Dict[str, Dict[str, Any]] = {}
+    # RDS product 테이블에 없는 항목은 절대 내려보내지 않음 (LLM/오염된 필드 제거)
+    catalog_by_pid, catalog_by_mid = await fetch_recommendation_catalog_maps(full_recommendation_list)
     catalog_by_name: Dict[str, Dict[str, Any]] = {}
-    if candidate_products:
-        for c in candidate_products:
-            if not isinstance(c, dict):
-                continue
-            mid = _to_str(c.get("model_id"))
-            nm = _normalize_name(c.get("name"))
-            if mid:
-                catalog_by_model_id[mid] = c
-            if nm:
-                catalog_by_name[nm] = c
 
     # 추천 이유 문자열은 알고리즘/DB 결과만 사용(LLM으로 패키지 문구 생성 안 함).
     for item in full_recommendation_list:
         if isinstance(item, dict):
             item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
             raw_products = item.get("products") or []
-            if catalog_by_model_id or catalog_by_name:
-                item["products"] = _enforce_products_from_catalog(
-                    raw_products,
-                    catalog_by_model_id=catalog_by_model_id,
-                    catalog_by_name=catalog_by_name,
-                )
-            else:
-                # 추천 알고리즘 경로(향후 구현) 또는 카탈로그 미사용 시 기존 정규화
-                normalized_products: list[dict[str, Any]] = []
-                if isinstance(raw_products, list):
-                    for p in raw_products:
-                        if not isinstance(p, dict):
-                            continue
-                        normalized_products.append({
-                            **p,
-                            "product_name": p.get("product_name") or p.get("name") or "",
-                            "product_url": p.get("product_url") or p.get("url") or "",
-                            "product_image_url": p.get("product_image_url") or p.get("image_url") or "",
-                        })
-                item["products"] = normalized_products
+            item["products"] = _enforce_products_from_catalog(
+                raw_products,
+                catalog_by_model_id=catalog_by_mid,
+                catalog_by_name=catalog_by_name,
+                catalog_by_product_id=catalog_by_pid if catalog_by_pid else None,
+                strict=True,
+            )
 
             # 예산 상한(일시불 기준) 적용: 패키지 총액이 상한을 넘지 않도록 제품 컷오프
             if isinstance(item.get("products"), list):
@@ -643,6 +646,29 @@ async def node_chat_result(state: ChatState) -> ChatState:
             item["appliances"] = appliances
             item["furniture"] = furniture
             item["reason"] = item.get("reason") or ""
+
+    # 검증 후 상품이 하나도 없는 패키지는 제거
+    full_recommendation_list = [
+        item
+        for item in full_recommendation_list
+        if isinstance(item, dict)
+        and isinstance(item.get("products"), list)
+        and len(item["products"]) > 0
+    ]
+
+    if not full_recommendation_list:
+        return {
+            **state,
+            "step": ChatStep.CHAT_6,
+            "data": {
+                "error": (
+                    "추천 결과에 포함된 상품이 RDS `product` 테이블에서 확인되지 않았습니다. "
+                    "product_id·model_id가 없거나 DB에 없는 행이면 응답에서 제외됩니다."
+                ),
+            },
+            "messages": messages,
+            "is_completed": False,
+        }
 
     display_recommendations = full_recommendation_list[:3]
     next_index = len(display_recommendations)
@@ -1097,48 +1123,49 @@ def _step_to_route_key(raw: Any) -> str:
     return "CHAT_0"
 
 
-def route_from_step(state: ChatState) -> str:
-    requested = state.get("requested_step_code")
-    if isinstance(requested, str):
-        # CHAT-5 처럼 끝 공백만 있어도 ChatStep 매칭 실패 → 잘못된 노드(예: chat_1)로 가던 문제 방지
-        requested = requested.strip().replace("-", "_").upper()
-    if requested and requested in ChatStep.__members__:
-        step_key = requested
+async def dispatch_node(state: ChatState) -> ChatState:
+    """
+    START → conditional_edges 대신 단일 진입점.
+    LangGraph가 체크포인트와 병합할 때 `requested_step_code`가 라우터에 안 넘어가
+    CHAT_1(예산)만 실행되던 문제를 막기 위해, 여기서 직접 stepCode에 맞는 핸들러만 호출합니다.
+    """
+    raw = state.get("requested_step_code")
+    if isinstance(raw, str):
+        raw = raw.strip().replace("-", "_").upper()
+    if raw and raw in ChatStep.__members__:
+        key = raw
     else:
-        # requested가 머지에서 빠진 경우에만 체크포인트 step 사용 (문자열 Enum 모두 허용)
-        step_key = _step_to_route_key(state.get("step"))
+        key = _step_to_route_key(state.get("step"))
 
-    mapping = {
-        "CHAT_0": "chat_0",
-        "CHAT_1": "chat_1",
-        "CHAT_2": "chat_2",
-        "CHAT_3": "chat_3",
-        "CHAT_4": "chat_4",
-        "CHAT_5": "chat_5",
-        "CHAT_6": "chat_6",
-        "CHAT_11": "chat_11",
-        "CHAT_RESULT": "chat_result",
-        "RECOMMEND_RAG": "recommend_rag",
-        "BLUEPRINT_RAG": "blueprint_rag",
+    logger.info("dispatch: requested_step_code=%r → resolved=%r", state.get("requested_step_code"), key)
+
+    handlers: Dict[str, Any] = {
+        "CHAT_0": node_chat_0,
+        "CHAT_1": node_chat_1,
+        "CHAT_2": node_chat_2,
+        "CHAT_3": node_chat_3,
+        "CHAT_4": node_chat_4,
+        "CHAT_5": node_chat_5,
+        "CHAT_6": node_chat_6,
+        "CHAT_11": node_chat_11,
+        "CHAT_RESULT": node_chat_result,
+        "RECOMMEND_RAG": node_recommend_rag,
+        "BLUEPRINT_RAG": node_blueprint_rag,
     }
-    return mapping.get(step_key, "chat_0")
+    fn = handlers.get(key)
+    if fn is None:
+        logger.warning("dispatch: unknown key=%r, fallback CHAT_0", key)
+        return node_chat_0(state)
+    if inspect.iscoroutinefunction(fn):
+        return await fn(state)
+    return fn(state)
+
 
 def build_graph():
     workflow = StateGraph(ChatState)
-    nodes = {
-        "chat_0": node_chat_0, "chat_1": node_chat_1, "chat_2": node_chat_2,
-        "chat_3": node_chat_3, "chat_4": node_chat_4,
-        "chat_5": node_chat_5, "chat_6": node_chat_6,
-        "chat_11": node_chat_11,
-        "chat_result": node_chat_result,
-        "recommend_rag": node_recommend_rag,
-        "blueprint_rag": node_blueprint_rag,
-    }
-    for name, func in nodes.items():
-        workflow.add_node(name, func)
-    workflow.add_conditional_edges(START, route_from_step)
-    for name in nodes.keys():
-        workflow.add_edge(name, END)
+    workflow.add_node("dispatch", dispatch_node)
+    workflow.add_edge(START, "dispatch")
+    workflow.add_edge("dispatch", END)
     return workflow.compile(checkpointer=get_checkpointer())
 
 chat_app = build_graph()

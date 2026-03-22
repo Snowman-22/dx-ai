@@ -227,7 +227,11 @@ ELECTRONICS_CATEGORIES = {
 
 
 def _format_appliance(p: dict) -> dict:
+    # DB row(dict) 그대로 내려가야 어댑터에서 model_id·brand·URL 매핑됨 (누락 시 LLM 출력처럼 보임)
     return {
+        "product_id":        p.get("product_id"),
+        "model_id":          p.get("model_id"),
+        "brand":             p.get("brand", ""),
         "name":              p.get("name", ""),
         "category":          p.get("category", ""),
         "totalPrice":        int(p.get("original_price") or p.get("price", 0)),
@@ -240,6 +244,9 @@ def _format_appliance(p: dict) -> dict:
 
 def _format_furniture(p: dict) -> dict:
     return {
+        "product_id": p.get("product_id"),
+        "model_id":   p.get("model_id"),
+        "brand":      p.get("brand", ""),
         "name":       p.get("name", ""),
         "category":   p.get("category", ""),
         "price":      int(p.get("price", 0)),

@@ -11,12 +11,14 @@
 
 **추천 알고리즘(EC2 `/data/recommendation_algorithm` 등)**  
 - 템플릿(`pipeline.py`, `db.py` …)은 **수정하지 않습니다.**  
-- `.env`에 `RECOMMENDATION_ALGORITHM_PATH`만 주고 **`RECOMMENDATION_ALGORITHM_ENTRYPOINT`를 비우거나 `pipeline:run_full_pipeline`** 이면, 내부 `pipeline_adapter`가 `run_full_pipeline(input_data, engine, use_llm=True)`를 호출합니다.  
+- `.env`에 `RECOMMENDATION_ALGORITHM_PATH`만 주고 **`RECOMMENDATION_ALGORITHM_ENTRYPOINT`를 비우거나 `pipeline:run_full_pipeline`** 이면, 내부 `pipeline_adapter`가 `run_full_pipeline(input_data, engine, use_llm=...)`를 호출합니다.  
+  - **추천 이유 문구 LLM**(템플릿 `recommendation_reason`): 기본 **끔**. 켜려면 `RECOMMENDATION_PIPELINE_USE_LLM=1` (또는 `true`/`yes`).  
   - `PATH`는 **`script/` 폴더의 부모**를 가리킵니다 (예: `…/recommendation_algorithm` — 그 안에 `script/pipeline.py`, `script/db.py` 가 있어야 함). 코드는 `script` 를 `sys.path`에 넣어 `from db import get_engine` 이 동작하게 합니다.  
 - 파이프라인 **output** `packages`(예: 12세트)는 `recommendation_list`로 변환되며, 기존과 같이 **`display_recommendations`는 처음 3개**만 내려갑니다(프론트 “한 번에 3패키지”와 맞춤).  
 - LangGraph `user_info` → 파이프라인 **input JSON** 매핑: 예산·평수·보유/필요 가전·라이프스타일(preferences)·style 등은 `pipeline_adapter.build_input_data_from_user_info`에서 구성(필드명은 팀 스펙에 맞게 조정 가능).  
 - PATH만 있고 파이프라인이 아닌 다른 `모듈:함수`를 쓰려면 `RECOMMENDATION_ALGORITHM_ENTRYPOINT`를 그에 맞게 설정.  
 - **미설정** 시 추천 목록을 **LLM으로 만들지 않으며**, `data.error`로 안내합니다(가짜 상품 방지).  
+- `CHAT_6` 응답 직전, 각 상품은 **RDS `product` 테이블에 `product_id` 또는 `model_id`로 대조**되며, **없는 행은 응답에서 제거**됩니다(가짜/LLM 상품 차단).  
 - 커스텀 진입 함수는 `(user_info, candidates)` 형태·반환은 `recommendation_list` dict 권장.
 
 **저장소 역할**  

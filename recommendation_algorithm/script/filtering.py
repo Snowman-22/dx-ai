@@ -81,6 +81,7 @@ def fetch_furniture(engine, needed_categories: list) -> pd.DataFrame:
     query = text(f"""
         SELECT
             p.product_id,
+            p.model_id,
             p.product_name          AS name,
             p.product_category      AS category,
             p.brand,

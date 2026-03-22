@@ -112,6 +112,7 @@ def _map_appliance_to_product(a: Dict[str, Any]) -> Dict[str, Any]:
     img = a.get("image") or ""
     url = a.get("productUrl") or a.get("product_url") or ""
     return {
+        "product_id": a.get("product_id"),
         "category": "appliance",
         "product_name": a.get("name") or "",
         "name": a.get("name") or "",
@@ -127,6 +128,7 @@ def _map_appliance_to_product(a: Dict[str, Any]) -> Dict[str, Any]:
 
 def _map_furniture_to_product(f: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        "product_id": f.get("product_id"),
         "category": "furniture",
         "product_name": f.get("name") or "",
         "name": f.get("name") or "",
@@ -212,7 +214,8 @@ def run_full_pipeline_wrapped(
     candidates: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    recommendation_algorithm 내 pipeline.run_full_pipeline(input_data, engine, use_llm=True) 호출.
+    recommendation_algorithm 내 pipeline.run_full_pipeline(input_data, engine, use_llm=...) 호출.
+    use_llm 은 기본 False (템플릿 내 추천 이유 LLM 비활성). 켜려면 RECOMMENDATION_PIPELINE_USE_LLM=1.
     candidates는 파이프라인이 DB에서 직접 조회한다면 사용하지 않음(시그니처 호환용).
     """
     _ = candidates
@@ -235,7 +238,24 @@ def run_full_pipeline_wrapped(
     from pipeline import run_full_pipeline
     from db import get_engine
 
+    # 템플릿 scoring.run_scoring(use_llm=True) 시 recommendation_reason.generate_reasons(LLM) 호출됨.
+    # 기본은 LLM 끔 — 이유만 필요하면 RECOMMENDATION_PIPELINE_USE_LLM=1
+    use_llm_reasons = os.getenv("RECOMMENDATION_PIPELINE_USE_LLM", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
     with get_engine() as engine:
-        output = run_full_pipeline(input_data, engine, use_llm=True)
+        output = run_full_pipeline(input_data, engine, use_llm=use_llm_reasons)
+
+    if not use_llm_reasons and isinstance(output, dict):
+        for pkg in output.get("packages") or []:
+            if not isinstance(pkg, dict):
+                continue
+            r = pkg.get("recommendationReason") or pkg.get("reason") or ""
+            if r in ("", "test"):
+                theme = pkg.get("theme") or "추천"
+                pkg["recommendationReason"] = f"「{theme}」 패키지 구성입니다."
 
     return pipeline_output_to_recommendation_list(output)

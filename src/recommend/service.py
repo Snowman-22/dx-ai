@@ -4,12 +4,83 @@ import asyncio
 import functools
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session_maker
 from ..products_repo import Chat, ProductEntity, Recommendation
 from .algorithm import RecommendationResult, rerank_and_filter
+
+
+def _product_entity_row_to_dict(r: ProductEntity) -> dict[str, Any]:
+    """ProductEntity row → fetch_candidate_products 와 동일 키."""
+    return {
+        "id": r.product_id,
+        "model_id": r.model_id,
+        "name": r.product_name,
+        "category": r.category,
+        "product_category": r.product_category,
+        "brand": r.brand,
+        "price": r.discount_price if r.discount_price is not None else r.original_price,
+        "original_price": r.original_price,
+        "discount_rate": r.discount_rate,
+        "discount_price": r.discount_price,
+        "is_subscribe": r.is_subscribe,
+        "review_score": r.review_score,
+        "review_cnt": r.review_cnt,
+        "url": r.product_url,
+        "image_url": r.product_image_url,
+    }
+
+
+async def fetch_recommendation_catalog_maps(
+    recommendation_list: list[Any],
+) -> tuple[dict[int, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """
+    추천 패키지에 등장한 product_id / model_id 만 RDS `product` 테이블에서 조회해
+    매칭용 맵을 만듭니다. (없는 ID는 맵에 없음 → 이후 단계에서 상품 제거)
+    """
+    pids: set[int] = set()
+    mids: set[str] = set()
+
+    for item in recommendation_list:
+        if not isinstance(item, dict):
+            continue
+        for p in item.get("products") or []:
+            if not isinstance(p, dict):
+                continue
+            raw_pid = p.get("product_id")
+            if raw_pid is not None and str(raw_pid).strip() != "":
+                try:
+                    pids.add(int(raw_pid))
+                except (TypeError, ValueError):
+                    pass
+            mid = str(p.get("model_id") or p.get("model") or "").strip()
+            if mid:
+                mids.add(mid)
+
+    if not pids and not mids:
+        return {}, {}
+
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        conds = []
+        if pids:
+            conds.append(ProductEntity.product_id.in_(pids))
+        if mids:
+            conds.append(ProductEntity.model_id.in_(mids))
+        stmt = select(ProductEntity).where(or_(*conds))
+        rows = (await session.execute(stmt)).scalars().all()
+
+    by_pid: dict[int, dict[str, Any]] = {}
+    by_mid: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        d = _product_entity_row_to_dict(r)
+        by_pid[r.product_id] = d
+        if r.model_id:
+            by_mid[str(r.model_id).strip()] = d
+
+    return by_pid, by_mid
 
 
 async def fetch_candidate_products(*, limit: int = 200) -> list[dict[str, Any]]:
