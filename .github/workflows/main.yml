@@ -1,5 +1,4 @@
-name: Deploy FastAPI to EC2 (With .env)
-
+name: Deploy FastAPI to EC2
 on:
   push:
     branches: [ main ]
@@ -21,6 +20,16 @@ jobs:
           docker build -t fastapi_snowman_image .
           docker save fastapi_snowman_image | gzip -1 > fastapi_snowman.tar.gz
           ls -lh fastapi_snowman.tar.gz
+
+      - name: Clean up old files on EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz
+            docker system prune -f
 
       - name: Copy Docker image to EC2 (native scp)
         env:
@@ -55,3 +64,4 @@ jobs:
               -v /data/recommendation_algorithm:/data/recommendation_algorithm \
               --name fastapi_snowman \
               fastapi_snowman_image
+            rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz
