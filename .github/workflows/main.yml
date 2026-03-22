@@ -19,21 +19,26 @@ jobs:
       - name: Build and Save Docker Image
         run: |
           docker build -t fastapi_snowman_image .
-          # gzip 으로 줄이면 전송 시간·실패율 감소 (대용량 tar SCP 타임아웃 방지)
           docker save fastapi_snowman_image | gzip -1 > fastapi_snowman.tar.gz
           ls -lh fastapi_snowman.tar.gz
 
-      - name: Copy Docker image to EC2
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "fastapi_snowman.tar.gz"
-          target: "/home/${{ secrets.EC2_USERNAME }}"
-          # 기본 타임아웃이 짧으면 큰 파일 전송이 중간에 끊겨 tar 손상남
-          timeout: 30m
-          command_timeout: 30m
+      - name: Copy Docker image to EC2 (native scp)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" | sed 's/\r$//' > ~/.ssh/ec2_deploy_key
+          chmod 600 ~/.ssh/ec2_deploy_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          scp -v -i ~/.ssh/ec2_deploy_key \
+            -o StrictHostKeyChecking=accept-new \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=120 \
+            fastapi_snowman.tar.gz "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/"
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@master
