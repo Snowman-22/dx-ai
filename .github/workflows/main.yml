@@ -37,6 +37,20 @@ jobs:
             -o StrictHostKeyChecking=accept-new \
             .env "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/fastapi_snowman.env"
 
+      - name: Clean old FastAPI image on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          script: |
+            set -e
+            docker stop fastapi_snowman || true
+            docker rm fastapi_snowman || true
+            docker rmi fastapi_snowman_image:latest || true
+            docker image prune -f || true
+
       - name: Stream Docker image to EC2
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -66,7 +80,6 @@ jobs:
 
             docker stop fastapi_snowman || true
             docker rm fastapi_snowman || true
-            docker rmi fastapi_snowman_image:latest || true
 
             docker run -d \
               --name fastapi_snowman \
