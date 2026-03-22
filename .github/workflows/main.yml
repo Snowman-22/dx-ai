@@ -23,14 +23,7 @@ jobs:
 
       - name: Archive source
         run: |
-          tar --exclude-vcs \
-            --exclude='.venv' \
-            --exclude='__pycache__' \
-            --exclude='.env' \
-            --exclude='.pytest_cache' \
-            --exclude='.mypy_cache' \
-            --exclude='fastapi_source.tar.gz' \
-            -czf fastapi_source.tar.gz .
+          git archive --format=tar.gz --output=fastapi_source.tar.gz HEAD
           ls -lh fastapi_source.tar.gz
 
       - name: Copy env file to EC2
