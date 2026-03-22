@@ -21,11 +21,6 @@ jobs:
           docker build --no-cache -t fastapi_snowman_image:${{ github.sha }} .
           docker tag fastapi_snowman_image:${{ github.sha }} fastapi_snowman_image:latest
 
-      - name: Save Docker image
-        run: |
-          docker save fastapi_snowman_image:${{ github.sha }} | gzip -1 > fastapi_snowman.tar.gz
-          ls -lh fastapi_snowman.tar.gz
-
       - name: Copy env file to EC2
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -42,7 +37,7 @@ jobs:
             -o StrictHostKeyChecking=accept-new \
             .env "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/fastapi_snowman.env"
 
-      - name: Copy Docker image to EC2
+      - name: Stream Docker image to EC2
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -54,9 +49,10 @@ jobs:
           echo "$SSH_PRIVATE_KEY" | sed 's/\r$//' > ~/.ssh/ec2_deploy_key
           chmod 600 ~/.ssh/ec2_deploy_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          scp -i ~/.ssh/ec2_deploy_key \
-            -o StrictHostKeyChecking=accept-new \
-            fastapi_snowman.tar.gz "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/"
+          docker save fastapi_snowman_image:${{ github.sha }} | gzip -1 | \
+            ssh -i ~/.ssh/ec2_deploy_key \
+              -o StrictHostKeyChecking=accept-new \
+              "${EC2_USERNAME}@${EC2_HOST}" 'gunzip -c | docker load'
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -72,8 +68,6 @@ jobs:
             docker rm fastapi_snowman || true
             docker rmi fastapi_snowman_image:latest || true
 
-            gunzip -c /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz | docker load
-
             docker run -d \
               --name fastapi_snowman \
               --restart unless-stopped \
@@ -88,6 +82,4 @@ jobs:
             docker exec fastapi_snowman env | grep RECOMMENDATION || true
             docker logs --tail 100 fastapi_snowman || true
             curl -s http://127.0.0.1:8000/health || true
-
-            rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz
             rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.env
