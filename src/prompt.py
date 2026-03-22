@@ -7,6 +7,10 @@ def build_recommendation_prompt(
     *,
     candidate_products: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
+    """
+    [사용 중단] 과거에는 node_chat_result 가 NotImplementedError 시 LLM으로 추천 JSON을 만들 때 썼음.
+    현재 graph 는 이 프롬프트를 호출하지 않음. LLM은 스키마 예시만 보고도 example.com 같은 가짜 URL·상품을 지어낼 수 있음.
+    """
     catalog_json = json.dumps(candidate_products or [], ensure_ascii=False)
     return f"""
 당신은 1인 자취/소형 공간에 특화된 인테리어 및 가전·가구 전문가입니다.

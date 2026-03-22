@@ -459,7 +459,14 @@ def node_chat_1(state: ChatState) -> ChatState:
     try:
         parsed = _parse_budget(user_text)
         user_info.update(parsed)
-        return {**state, "step": ChatStep.CHAT_2, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+        return {
+            **state,
+            "step": ChatStep.CHAT_2,
+            "user_info": user_info,
+            "data": {},
+            "ai_response": None,
+            "messages": _append_message(state, role="user", content=user_text),
+        }
     except ValueError:
         return {**state, "step": ChatStep.CHAT_1, "data": {"error": "예산을 다시 입력해주세요."}, "messages": _append_message(state, role="user", content=user_text)}
 
@@ -469,7 +476,14 @@ def node_chat_2(state: ChatState) -> ChatState:
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
     user_info["size"] = user_text
-    return {**state, "step": ChatStep.CHAT_3, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+    return {
+        **state,
+        "step": ChatStep.CHAT_3,
+        "user_info": user_info,
+        "data": {},
+        "ai_response": None,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
 
 
 def node_chat_3(state: ChatState) -> ChatState:
@@ -480,7 +494,14 @@ def node_chat_3(state: ChatState) -> ChatState:
         user_info["lifestyle"] = ", ".join(_to_str(x) for x in user_text)
     else:
         user_info["lifestyle"] = user_text
-    return {**state, "step": ChatStep.CHAT_4, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+    return {
+        **state,
+        "step": ChatStep.CHAT_4,
+        "user_info": user_info,
+        "data": {},
+        "ai_response": None,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
 
 
 def _coerce_chat4_user_text(user_text: Any) -> Any:
@@ -521,7 +542,14 @@ def node_chat_4(state: ChatState) -> ChatState:
             )
     else:
         user_info["needed_appliances"] = _extract_needed_list(user_text)
-    return {**state, "step": ChatStep.CHAT_5, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+    return {
+        **state,
+        "step": ChatStep.CHAT_5,
+        "user_info": user_info,
+        "data": {},
+        "ai_response": None,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
 
 
 def node_chat_5(state: ChatState) -> ChatState:
@@ -532,16 +560,31 @@ def node_chat_5(state: ChatState) -> ChatState:
         user_info["purchase_plans"] = ", ".join(_to_str(x) for x in user_text)
     else:
         user_info["purchase_plans"] = user_text
+    furniture_needed = _extract_needed_list(user_text)
+    if furniture_needed:
+        user_info["furniture_needed"] = furniture_needed
     if _to_str(user_info.get("purchase_plans")):
         user_info["need_furniture"] = True
-    return {**state, "step": ChatStep.CHAT_6, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
+    return {
+        **state,
+        "step": ChatStep.CHAT_6,
+        "user_info": user_info,
+        "data": {},
+        "ai_response": None,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
 
 
 async def node_chat_6(state: ChatState) -> ChatState:
     """CHAT_6: 추천 리스트 생성."""
     user_text = state.get("last_user_input")
     if user_text is not None:
-        state = {**state, "messages": _append_message(state, role="user", content=user_text)}
+        state = {
+            **state,
+            "data": {},
+            "ai_response": None,
+            "messages": _append_message(state, role="user", content=user_text),
+        }
     return await node_chat_result(state)
 
 
@@ -550,7 +593,7 @@ def node_chat_11(state: ChatState) -> ChatState:
     진단 종료 단계.
     프론트에서 종료/저장 UI를 처리하므로 여기서는 종료 상태만 플래그로 남깁니다.
     """
-    return {**state, "step": ChatStep.CHAT_11, "is_completed": True}
+    return {**state, "step": ChatStep.CHAT_11, "data": {}, "ai_response": None, "is_completed": True}
 
 
 async def node_chat_result(state: ChatState) -> ChatState:

@@ -1,4 +1,5 @@
 name: Deploy FastAPI to EC2
+
 on:
   push:
     branches: [ main ]
@@ -13,25 +14,19 @@ jobs:
 
       - name: Create .env file
         run: |
-          echo "${{ secrets.ENV_FILE }}" > .env
+          printf '%s\n' "${{ secrets.ENV_FILE }}" > .env
 
-      - name: Build and Save Docker Image
+      - name: Build Docker image
         run: |
-          docker build -t fastapi_snowman_image .
-          docker save fastapi_snowman_image | gzip -1 > fastapi_snowman.tar.gz
+          docker build --no-cache -t fastapi_snowman_image:${{ github.sha }} .
+          docker tag fastapi_snowman_image:${{ github.sha }} fastapi_snowman_image:latest
+
+      - name: Save Docker image
+        run: |
+          docker save fastapi_snowman_image:${{ github.sha }} | gzip -1 > fastapi_snowman.tar.gz
           ls -lh fastapi_snowman.tar.gz
 
-      - name: Clean up old files on EC2
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz
-            docker system prune -f
-
-      - name: Copy Docker image to EC2 (native scp)
+      - name: Copy env file to EC2
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -43,25 +38,55 @@ jobs:
           echo "$SSH_PRIVATE_KEY" | sed 's/\r$//' > ~/.ssh/ec2_deploy_key
           chmod 600 ~/.ssh/ec2_deploy_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          scp -v -i ~/.ssh/ec2_deploy_key \
+          scp -i ~/.ssh/ec2_deploy_key \
             -o StrictHostKeyChecking=accept-new \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=120 \
+            .env "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/fastapi_snowman.env"
+
+      - name: Copy Docker image to EC2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" | sed 's/\r$//' > ~/.ssh/ec2_deploy_key
+          chmod 600 ~/.ssh/ec2_deploy_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          scp -i ~/.ssh/ec2_deploy_key \
+            -o StrictHostKeyChecking=accept-new \
             fastapi_snowman.tar.gz "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/"
 
       - name: Deploy to EC2
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 30m
           script: |
+            set -e
+
             docker stop fastapi_snowman || true
             docker rm fastapi_snowman || true
+
             gunzip -c /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz | docker load
-            docker run -d -p 8000:8000 \
-              -v /data/recommendation_algorithm:/data/recommendation_algorithm \
+
+            docker run -d \
               --name fastapi_snowman \
-              fastapi_snowman_image
+              --restart unless-stopped \
+              -p 8000:8000 \
+              --env-file /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.env \
+              -e RECOMMENDATION_ALGORITHM_PATH=/data/recommendation_algorithm \
+              -v /data/recommendation_algorithm:/data/recommendation_algorithm:ro \
+              fastapi_snowman_image:${{ github.sha }}
+
+            sleep 5
+            docker ps
+            docker exec fastapi_snowman env | grep RECOMMENDATION || true
+            docker logs --tail 100 fastapi_snowman || true
+            curl -s http://127.0.0.1:8000/health || true
+
             rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz
+            rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.env
