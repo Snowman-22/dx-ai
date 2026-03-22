@@ -460,9 +460,34 @@ def node_chat_3(state: ChatState) -> ChatState:
     return {**state, "step": ChatStep.CHAT_4, "user_info": user_info, "messages": _append_message(state, role="user", content=user_text)}
 
 
+def _coerce_chat4_user_text(user_text: Any) -> Any:
+    """
+    프론트가 JSON 객체 대신 문자열로 일부만 보낸 경우 보정.
+    예: '  "owned": [...], "needed": [...]  ' → dict
+    """
+    if isinstance(user_text, dict):
+        return user_text
+    if not isinstance(user_text, str):
+        return user_text
+    s = user_text.strip()
+    if not s:
+        return user_text
+    if s.startswith("{"):
+        try:
+            return json.loads(s)
+        except Exception:
+            return user_text
+    if "owned" in s or "needed" in s:
+        try:
+            return json.loads("{" + s + "}")
+        except Exception:
+            return user_text
+    return user_text
+
+
 def node_chat_4(state: ChatState) -> ChatState:
     """CHAT_4: 보유 + 필요(필수) 가전 — owned / needed 를 한 요청에."""
-    user_text = state.get("last_user_input")
+    user_text = _coerce_chat4_user_text(state.get("last_user_input"))
     user_info = dict(state.get("user_info") or {})
     if isinstance(user_text, dict):
         if "owned" in user_text:
@@ -1091,9 +1116,13 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
 def route_from_step(state: ChatState) -> str:
     requested = state.get("requested_step_code")
     if isinstance(requested, str):
-        # 예시 문서 표기는 CHAT-6 처럼 하이픈이 올 수 있어, 프론트/문서 불일치를 방어합니다.
-        requested = requested.replace("-", "_").upper()
-    step = ChatStep(requested) if requested and requested in ChatStep.__members__ else state.get("step", ChatStep.CHAT_0)
+        # CHAT-5 처럼 끝 공백만 있어도 ChatStep 매칭 실패 → 잘못된 노드(예: chat_1)로 가던 문제 방지
+        requested = requested.strip().replace("-", "_").upper()
+    if requested and requested in ChatStep.__members__:
+        step = ChatStep(requested)
+    else:
+        # app.py에서 stepCode를 검증하지만, 그래프만 호출할 때는 체크포인트 step으로 폴백
+        step = state.get("step", ChatStep.CHAT_0)
     mapping = {
         ChatStep.CHAT_0: "chat_0",
         ChatStep.CHAT_1: "chat_1",

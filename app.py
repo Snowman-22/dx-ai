@@ -9,8 +9,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.graph import chat_app, ChatState
+from src.graph import ChatStep, chat_app, ChatState
 from src.state_store import get_checkpointer
+
+
+def _normalize_step_code(raw: str) -> str:
+    """하이픈/공백/대소문자 차이로 ChatStep 매칭이 실패해 잘못된 노드로 가는 것을 방지."""
+    return (raw or "").strip().replace("-", "_").upper()
 
 from sqlalchemy import text
 from src.db import get_engine  # 이미 있다면 패스!
@@ -61,6 +66,18 @@ def create_app() -> FastAPI:
         if not payload.step_code:
             raise HTTPException(status_code=400, detail="step_code is required")
 
+        norm_step = _normalize_step_code(payload.step_code)
+        if norm_step not in ChatStep.__members__:
+            return ChatResponse(
+                data={
+                    "error": (
+                        f"지원하지 않는 stepCode입니다: {payload.step_code!r}. "
+                        f"허용: {', '.join(sorted(ChatStep.__members__))}"
+                    )
+                },
+                ai_response=None,
+            )
+
         # LangGraph state 초기화 / 복구
         # conv_id를 그대로 LangGraph thread_id로 사용하고,
         # DynamoDB 체크포인터 및 Postgres Chat.conv_id와 동일한 값으로 연결합니다.
@@ -75,7 +92,7 @@ def create_app() -> FastAPI:
         state: ChatState = {
             # checkpointer가 복구한 기존 step이 라우팅에 우선 적용될 수 있어,
             # 요청에서 넘어온 step_code를 별도 필드로 보관하고 그래프 라우팅에서 우선순위를 강제합니다.
-            "requested_step_code": payload.step_code,
+            "requested_step_code": norm_step,
             "incoming_assistant_message": payload.assistant_text,
             "last_user_input": payload.user_text,
         }
@@ -86,7 +103,7 @@ def create_app() -> FastAPI:
 
         # CHAT_0~CHAT_5: 추천(CHAT_6) 전까지는 보통 data가 비어 있음.
         # 프론트가 "저장 완료" 여부를 쉽게 판단할 수 있도록 메시지를 채워줍니다.
-        if payload.step_code in {
+        if norm_step in {
             "CHAT_0",
             "CHAT_1",
             "CHAT_2",
