@@ -70,6 +70,7 @@ jobs:
 
             docker stop fastapi_snowman || true
             docker rm fastapi_snowman || true
+            docker rmi fastapi_snowman_image:latest || true
 
             gunzip -c /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz | docker load
 
