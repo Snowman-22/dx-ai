@@ -60,7 +60,8 @@ def rerank_and_filter(
 ) -> RecommendationResult:
     """
     1) 환경 변수로 지정한 **외부 폴더**(예: recommendation_algorithm)의 코드를 호출 — 그 안의 파일은 편집하지 않음.
-    2) 미설정 시 NotImplementedError → graph.node_chat_result에서 LLM 폴백.
+    2) 미설정 시 try_run_external 이 None → NotImplementedError (추천 엔진 미구성).
+       파이프라인이 예외를 내면 None 이 아니라 예외가 그대로 전파됩니다.
 
     환경 변수:
     - RECOMMENDATION_ALGORITHM_PATH: 예 /data/recommendation_algorithm (sys.path에 추가)

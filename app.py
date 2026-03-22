@@ -89,14 +89,25 @@ def create_app() -> FastAPI:
         #
         # step_code는 "프론트/스프링이 가진 현재 단계"이며, FastAPI는 이를 기준으로 라우팅합니다.
         # (checkpoint에 저장된 step이 있더라도, 요청으로 들어온 step_code를 우선합니다.)
-        state: ChatState = {
-            # checkpointer가 복구한 기존 step이 라우팅에 우선 적용될 수 있어,
-            # 요청에서 넘어온 step_code를 별도 필드로 보관하고 그래프 라우팅에서 우선순위를 강제합니다.
+        # 이번 요청 필드만 넘기면 체크포인트 병합 순서에 따라 requested_step_code가
+        # 사라지거나 step만 남아 CHAT_5 입력이 CHAT_1(예산 파싱)으로 갈 수 있음 → 스냅샷과 병합.
+        incoming: ChatState = {
             "requested_step_code": norm_step,
             "incoming_assistant_message": payload.assistant_text,
             "last_user_input": payload.user_text,
         }
-        result = await chat_app.ainvoke(state, config=config)
+        merged: ChatState = dict(incoming)
+        snap = None
+        try:
+            if hasattr(chat_app, "aget_state"):
+                snap = await chat_app.aget_state(config)
+            elif hasattr(chat_app, "get_state"):
+                snap = chat_app.get_state(config)
+        except Exception:
+            snap = None
+        if snap is not None and getattr(snap, "values", None):
+            merged = {**dict(snap.values), **incoming}
+        result = await chat_app.ainvoke(merged, config=config)
 
         data = result.get("data", {}) or {}
         ai_response = result.get("ai_response")
@@ -145,7 +156,24 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        """
+        추천 엔진 설정 여부 — 배포 후 여기서 path_exists / will_use_pipeline 를 꼭 확인하세요.
+        (로컬 .env 에만 있고 Docker ENV/secret 에 없으면 컨테이너에서는 비어 있음 → 파이프라인 미실행)
+        """
+        ra_path = os.getenv("RECOMMENDATION_ALGORITHM_PATH", "").strip()
+        ra_entry = os.getenv("RECOMMENDATION_ALGORITHM_ENTRYPOINT", "").strip().lower()
+        path_exists = bool(ra_path and os.path.isdir(ra_path))
+        use_pipeline = bool(ra_path) and (not ra_entry or ra_entry == "pipeline:run_full_pipeline")
+        return {
+            "status": "ok",
+            "recommendation_engine": {
+                "path_configured": bool(ra_path),
+                "path": ra_path or None,
+                "path_exists": path_exists,
+                "entrypoint": ra_entry or None,
+                "will_use_pipeline": use_pipeline and path_exists,
+            },
+        }
 
     return app
 

@@ -16,7 +16,7 @@
 - 파이프라인 **output** `packages`(예: 12세트)는 `recommendation_list`로 변환되며, 기존과 같이 **`display_recommendations`는 처음 3개**만 내려갑니다(프론트 “한 번에 3패키지”와 맞춤).  
 - LangGraph `user_info` → 파이프라인 **input JSON** 매핑: 예산·평수·보유/필요 가전·라이프스타일(preferences)·style 등은 `pipeline_adapter.build_input_data_from_user_info`에서 구성(필드명은 팀 스펙에 맞게 조정 가능).  
 - PATH만 있고 파이프라인이 아닌 다른 `모듈:함수`를 쓰려면 `RECOMMENDATION_ALGORITHM_ENTRYPOINT`를 그에 맞게 설정.  
-- **미설정** 시 **LLM 폴백**으로 동작합니다.  
+- **미설정** 시 추천 목록을 **LLM으로 만들지 않으며**, `data.error`로 안내합니다(가짜 상품 방지).  
 - 커스텀 진입 함수는 `(user_info, candidates)` 형태·반환은 `recommendation_list` dict 권장.
 
 **저장소 역할**  
@@ -117,6 +117,20 @@ python main.py
 ```bash
 uvicorn app:app --reload
 ```
+
+### 3-1. Docker / EC2에서 추천 알고리즘이 “안 도는 것처럼” 보일 때
+
+코드상 동작은 이렇게만 갈립니다.
+
+| 상황 | 결과 |
+|------|------|
+| `RECOMMENDATION_ALGORITHM_PATH` 가 **비어 있음** | `try_run_external` → `None` → 예전에는 LLM 폴백, 지금은 `data.error` |
+| PATH는 있는데 **디렉터리가 없음** (`/data/...` 를 쓰는데 컨테이너에 마운트 안 됨 등) | **예외** (FileNotFoundError 등) — LLM 폴백이 아님 |
+| PATH가 있고 **`recommendation_algorithm/script`** 가 열림 | `pipeline.run_full_pipeline` 실행 (DB는 템플릿 `db.py`·RDS 설정에 따름) |
+
+- **로컬**에서는 `.env`에 `RECOMMENDATION_ALGORITHM_PATH`가 있어도, **Docker 이미지**에는 `.env`가 기본으로 들어가지 않습니다(`.gitignore`). **컨테이너 실행 시** `ENV` 또는 `-e` / secrets 로 같은 변수를 넣어야 합니다.
+- 이 레포의 `Dockerfile`은 **이미지에 포함된** `recommendation_algorithm/` 를 쓰도록 `ENV RECOMMENDATION_ALGORITHM_PATH=/app/recommendation_algorithm` 기본값을 둡니다. EC2에서만 `/data` 볼륨을 쓰면 실행 시 `RECOMMENDATION_ALGORITHM_PATH=/data/recommendation_algorithm` 로 덮어쓰면 됩니다.
+- 배포 후 **`GET /health`** 의 `recommendation_engine.path_exists` / `will_use_pipeline` 이 **true** 인지 확인하세요.
 
 ### 4. Spring Boot ↔ FastAPI 연동 규약
 

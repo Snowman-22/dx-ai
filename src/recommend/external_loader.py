@@ -82,7 +82,7 @@ def try_run_external(
 ) -> Optional[Any]:
     """
     외부 알고리즘이 설정되어 있으면 실행하고 원시 결과를 반환.
-    설정이 없으면 None (NotImplemented → LLM 폴백).
+    설정이 없으면 None → algorithm.rerank_and_filter 에서 NotImplementedError.
 
     - RECOMMENDATION_ALGORITHM_PATH 만 있거나 ENTRYPOINT 가 pipeline:run_full_pipeline 이면
       pipeline_adapter.run_full_pipeline_wrapped (run_full_pipeline + sync engine)

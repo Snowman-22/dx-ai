@@ -12,14 +12,11 @@ from .db import get_session_maker
 from .product_details import fetch_products_bundle_details
 from .state_store import get_checkpointer
 from .prompt import (
-    build_package_reason_prompt,
     build_blueprint_rag_prompt,
-    build_recommendation_prompt,
     build_rag_prompt,
     build_rag_prompt_with_package_context,
 )
 from .recommend import generate_recommendation_result
-from .recommend.service import fetch_candidate_products
 
 
 class ChatStep(str, Enum):
@@ -553,12 +550,27 @@ async def node_chat_result(state: ChatState) -> ChatState:
             })
         total_estimated_budget = result.total_estimated_budget
     except NotImplementedError:
-        candidate_products = await fetch_candidate_products(limit=300)
-        prompt = build_recommendation_prompt(user_info, candidate_products=candidate_products)
-        resp = await llm_json.ainvoke(prompt) # 비동기 환경이므로 ainvoke 추천
-        content_json = _extract_json_from_llm_response(resp)
-        full_recommendation_list = content_json.get("recommendation_list") or content_json.get("data") or []
-        total_estimated_budget = content_json.get("total_estimated_budget", "")
+        return {
+            **state,
+            "step": ChatStep.CHAT_6,
+            "data": {
+                "error": (
+                    "추천 엔진이 설정되지 않았습니다. 서버에 RECOMMENDATION_ALGORITHM_PATH(및 필요 시 "
+                    "RECOMMENDATION_ALGORITHM_ENTRYPOINT)를 설정한 뒤 다시 시도해 주세요. "
+                    "LLM으로 가짜 상품을 만들지 않습니다."
+                ),
+            },
+            "messages": messages,
+            "is_completed": False,
+        }
+    except Exception as e:
+        return {
+            **state,
+            "step": ChatStep.CHAT_6,
+            "data": {"error": f"추천 생성에 실패했습니다: {e!s}"},
+            "messages": messages,
+            "is_completed": False,
+        }
 
     if not isinstance(full_recommendation_list, list):
         full_recommendation_list = []
@@ -576,6 +588,7 @@ async def node_chat_result(state: ChatState) -> ChatState:
             if nm:
                 catalog_by_name[nm] = c
 
+    # 추천 이유 문자열은 알고리즘/DB 결과만 사용(LLM으로 패키지 문구 생성 안 함).
     for item in full_recommendation_list:
         if isinstance(item, dict):
             item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
@@ -629,52 +642,7 @@ async def node_chat_result(state: ChatState) -> ChatState:
                             furniture.append(p)
             item["appliances"] = appliances
             item["furniture"] = furniture
-
-    if full_recommendation_list:
-        packages_payload: list[Dict[str, Any]] = []
-        for i, item in enumerate(full_recommendation_list):
-            if not isinstance(item, dict): continue
-            package_name = item.get("name") or item.get("package_name") or f"패키지_{i+1}"
-            products = item.get("products") or []
-            simplified_products = []
-            if isinstance(products, list):
-                for p in products:
-                    if not isinstance(p, dict): continue
-                    simplified_products.append({
-                        "category": p.get("category"),
-                        "product_name": p.get("product_name") or p.get("name"),
-                        "model_id": p.get("model_id") or p.get("model"),
-                        "brand": p.get("brand"),
-                        "price_normal": p.get("price_normal"),
-                        "price_subscription": p.get("price_subscription"),
-                        "price": p.get("price"),
-                        "product_image_url": p.get("product_image_url") or p.get("image_url"),
-                        "product_url": p.get("product_url") or p.get("url"),
-                    })
-
-            packages_payload.append({
-                "index": i,
-                "package_name": package_name,
-                "products": simplified_products,
-                "appliance_price_normal_sum": item.get("appliance_price_normal_sum"),
-                "appliance_price_subscription_sum": item.get("appliance_price_subscription_sum"),
-                "furniture_price_sum": item.get("furniture_price_sum"),
-            })
-
-        reason_prompt = build_package_reason_prompt(user_info, packages_payload)
-        resp = await llm_json.ainvoke(reason_prompt)
-        reasons_json = _extract_json_from_llm_response(resp)
-        reasons = reasons_json.get("reasons") or []
-
-        for i, item in enumerate(full_recommendation_list):
-            if isinstance(item, dict):
-                item["reason"] = item.get("reason") or ""
-        for r in reasons:
-            if not isinstance(r, dict): continue
-            idx = r.get("index")
-            if isinstance(idx, int) and 0 <= idx < len(full_recommendation_list):
-                if isinstance(full_recommendation_list[idx], dict):
-                    full_recommendation_list[idx]["reason"] = r.get("reason") or full_recommendation_list[idx].get("reason")
+            item["reason"] = item.get("reason") or ""
 
     display_recommendations = full_recommendation_list[:3]
     next_index = len(display_recommendations)
@@ -1113,30 +1081,47 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         "is_completed": True,
     }
 
+def _step_to_route_key(raw: Any) -> str:
+    """
+    DynamoDB/JSON 복원 시 step이 문자열로만 들어오면 Enum 키와 매칭되지 않아
+    잘못된 노드(chat_0)로 가거나, 폴백 step과 꼬일 수 있음 → 문자열 키로 통일.
+    """
+    if raw is None:
+        return "CHAT_0"
+    if isinstance(raw, ChatStep):
+        return raw.name
+    if isinstance(raw, str):
+        s = raw.strip().replace("-", "_").upper()
+        if s in ChatStep.__members__:
+            return s
+    return "CHAT_0"
+
+
 def route_from_step(state: ChatState) -> str:
     requested = state.get("requested_step_code")
     if isinstance(requested, str):
         # CHAT-5 처럼 끝 공백만 있어도 ChatStep 매칭 실패 → 잘못된 노드(예: chat_1)로 가던 문제 방지
         requested = requested.strip().replace("-", "_").upper()
     if requested and requested in ChatStep.__members__:
-        step = ChatStep(requested)
+        step_key = requested
     else:
-        # app.py에서 stepCode를 검증하지만, 그래프만 호출할 때는 체크포인트 step으로 폴백
-        step = state.get("step", ChatStep.CHAT_0)
+        # requested가 머지에서 빠진 경우에만 체크포인트 step 사용 (문자열 Enum 모두 허용)
+        step_key = _step_to_route_key(state.get("step"))
+
     mapping = {
-        ChatStep.CHAT_0: "chat_0",
-        ChatStep.CHAT_1: "chat_1",
-        ChatStep.CHAT_2: "chat_2",
-        ChatStep.CHAT_3: "chat_3",
-        ChatStep.CHAT_4: "chat_4",
-        ChatStep.CHAT_5: "chat_5",
-        ChatStep.CHAT_6: "chat_6",
-        ChatStep.CHAT_11: "chat_11",
-        ChatStep.CHAT_RESULT: "chat_result",
-        ChatStep.RECOMMEND_RAG: "recommend_rag",
-        ChatStep.BLUEPRINT_RAG: "blueprint_rag",
+        "CHAT_0": "chat_0",
+        "CHAT_1": "chat_1",
+        "CHAT_2": "chat_2",
+        "CHAT_3": "chat_3",
+        "CHAT_4": "chat_4",
+        "CHAT_5": "chat_5",
+        "CHAT_6": "chat_6",
+        "CHAT_11": "chat_11",
+        "CHAT_RESULT": "chat_result",
+        "RECOMMEND_RAG": "recommend_rag",
+        "BLUEPRINT_RAG": "blueprint_rag",
     }
-    return mapping.get(step, "chat_0")
+    return mapping.get(step_key, "chat_0")
 
 def build_graph():
     workflow = StateGraph(ChatState)
