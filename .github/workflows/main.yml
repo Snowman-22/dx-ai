@@ -19,7 +19,9 @@ jobs:
       - name: Build and Save Docker Image
         run: |
           docker build -t fastapi_snowman_image .
-          docker save fastapi_snowman_image > fastapi_snowman.tar
+          # gzip 으로 줄이면 전송 시간·실패율 감소 (대용량 tar SCP 타임아웃 방지)
+          docker save fastapi_snowman_image | gzip -1 > fastapi_snowman.tar.gz
+          ls -lh fastapi_snowman.tar.gz
 
       - name: Copy Docker image to EC2
         uses: appleboy/scp-action@master
@@ -27,8 +29,11 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "fastapi_snowman.tar"
+          source: "fastapi_snowman.tar.gz"
           target: "/home/${{ secrets.EC2_USERNAME }}"
+          # 기본 타임아웃이 짧으면 큰 파일 전송이 중간에 끊겨 tar 손상남
+          timeout: 30m
+          command_timeout: 30m
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@master
@@ -36,10 +41,11 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
           script: |
             docker stop fastapi_snowman || true
             docker rm fastapi_snowman || true
-            docker load < /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar
+            gunzip -c /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.tar.gz | docker load
             docker run -d -p 8000:8000 \
               -v /data/recommendation_algorithm:/data/recommendation_algorithm \
               --name fastapi_snowman \
