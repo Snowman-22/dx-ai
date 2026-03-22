@@ -21,6 +21,17 @@ jobs:
           docker build --no-cache -t fastapi_snowman_image:${{ github.sha }} .
           docker tag fastapi_snowman_image:${{ github.sha }} fastapi_snowman_image:latest
 
+      - name: Archive source
+        run: |
+          tar --exclude-vcs \
+            --exclude='.venv' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            --exclude='.pytest_cache' \
+            --exclude='.mypy_cache' \
+            -czf fastapi_source.tar.gz .
+          ls -lh fastapi_source.tar.gz
+
       - name: Copy env file to EC2
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -37,21 +48,7 @@ jobs:
             -o StrictHostKeyChecking=accept-new \
             .env "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/fastapi_snowman.env"
 
-      - name: Clean old FastAPI image on EC2
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 30m
-          script: |
-            set -e
-            docker stop fastapi_snowman || true
-            docker rm fastapi_snowman || true
-            docker rmi fastapi_snowman_image:latest || true
-            docker image prune -f || true
-
-      - name: Stream Docker image to EC2
+      - name: Copy source to EC2
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -63,10 +60,9 @@ jobs:
           echo "$SSH_PRIVATE_KEY" | sed 's/\r$//' > ~/.ssh/ec2_deploy_key
           chmod 600 ~/.ssh/ec2_deploy_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          docker save fastapi_snowman_image:${{ github.sha }} | gzip -1 | \
-            ssh -i ~/.ssh/ec2_deploy_key \
-              -o StrictHostKeyChecking=accept-new \
-              "${EC2_USERNAME}@${EC2_HOST}" 'gunzip -c | docker load'
+          scp -i ~/.ssh/ec2_deploy_key \
+            -o StrictHostKeyChecking=accept-new \
+            fastapi_source.tar.gz "${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/"
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -78,8 +74,17 @@ jobs:
           script: |
             set -e
 
+            rm -rf /home/${{ secrets.EC2_USERNAME }}/fastapi_chat_deploy
+            mkdir -p /home/${{ secrets.EC2_USERNAME }}/fastapi_chat_deploy
+            tar -xzf /home/${{ secrets.EC2_USERNAME }}/fastapi_source.tar.gz -C /home/${{ secrets.EC2_USERNAME }}/fastapi_chat_deploy
+
             docker stop fastapi_snowman || true
             docker rm fastapi_snowman || true
+            docker rmi fastapi_snowman_image:latest || true
+            docker image prune -f || true
+
+            cd /home/${{ secrets.EC2_USERNAME }}/fastapi_chat_deploy
+            docker build --no-cache -t fastapi_snowman_image:latest .
 
             docker run -d \
               --name fastapi_snowman \
@@ -88,7 +93,7 @@ jobs:
               --env-file /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.env \
               -e RECOMMENDATION_ALGORITHM_PATH=/data/recommendation_algorithm \
               -v /data/recommendation_algorithm:/data/recommendation_algorithm:ro \
-              fastapi_snowman_image:${{ github.sha }}
+              fastapi_snowman_image:latest
 
             sleep 5
             docker ps
@@ -96,3 +101,4 @@ jobs:
             docker logs --tail 100 fastapi_snowman || true
             curl -s http://127.0.0.1:8000/health || true
             rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.env
+            rm -f /home/${{ secrets.EC2_USERNAME }}/fastapi_source.tar.gz
