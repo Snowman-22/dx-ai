@@ -22,6 +22,8 @@ N_PACKAGES          = 60   # 전체 조합 풀 크기 (테마 3개 × 4개 여�
 N_THEMES            = 3    # 테마 수
 N_PER_THEME         = 4    # 테마별 패키지 수
 N_DISPLAY           = N_THEMES  # _determine_themes용
+MIN_PACKAGES        = 3    # 최종 최소 패키지 수
+MIN_PRODUCTS_PER_PACKAGE = 3  # 패키지당 최소 상품 수
 
 
 # ================================================================== #
@@ -187,6 +189,147 @@ def _score_by_theme(pkg: dict, theme: str, budget: int) -> float:
         return pkg["package_score"]
 
 
+def _product_identity_key(p: dict) -> str:
+    """
+    패키지 간 전역 중복 체크용 상품 식별 키.
+    product_id를 우선 사용하고, 없으면 model_id, 마지막으로 name+category를 사용.
+    """
+    pid = p.get("product_id")
+    if pid is not None and str(pid).strip():
+        return f"pid:{str(pid).strip()}"
+
+    mid = p.get("model_id")
+    if mid is not None and str(mid).strip():
+        return f"mid:{str(mid).strip()}"
+
+    name = str(p.get("name") or "").strip().lower()
+    cat = str(p.get("category") or "").strip().lower()
+    if name or cat:
+        return f"namecat:{name}|{cat}"
+    return ""
+
+
+def _package_product_keys(pkg: dict) -> set:
+    products = pkg.get("products") or []
+    keys = set()
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        k = _product_identity_key(p)
+        if k:
+            keys.add(k)
+    return keys
+
+
+def _package_signature(pkg: dict) -> tuple:
+    """패키지 동일성 비교용 시그니처(상품 식별키 정렬 튜플)."""
+    keys = sorted(_package_product_keys(pkg))
+    return tuple(keys)
+
+
+def _build_global_product_pool(reranked: dict) -> list:
+    """
+    패키지 상품 수 보강용 전역 상품 풀.
+    카테고리별 상위 TOP_N_PER_CATEGORY를 점수 기준으로 모아 중복 제거.
+    """
+    pool = []
+    seen = set()
+    for _, df in reranked.items():
+        rows = df.head(TOP_N_PER_CATEGORY).to_dict("records")
+        for p in rows:
+            if not isinstance(p, dict):
+                continue
+            k = _product_identity_key(p)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            pool.append(p)
+    return pool
+
+
+def _ensure_min_products(pkg: dict, global_pool: list, min_count: int) -> dict:
+    """
+    패키지 상품 수가 min_count 미만이면 전역 풀에서 중복 없는 상품을 보강.
+    """
+    out = dict(pkg)
+    products = out.get("products")
+    if not isinstance(products, list):
+        products = []
+    products = list(products)
+
+    used = set()
+    for p in products:
+        if isinstance(p, dict):
+            k = _product_identity_key(p)
+            if k:
+                used.add(k)
+
+    if len(products) < min_count:
+        for gp in global_pool:
+            if not isinstance(gp, dict):
+                continue
+            k = _product_identity_key(gp)
+            if not k or k in used:
+                continue
+            products.append(gp)
+            used.add(k)
+            if len(products) >= min_count:
+                break
+
+    out["products"] = products
+    out["total_price"] = int(sum(p.get("price", 0) for p in products if isinstance(p, dict)))
+    if products:
+        # budget=0이면 budget_fit=1.0로 처리되어 상품 점수 평균 중심으로 계산됨
+        out["package_score"] = _calc_package_score(products, 0)
+    else:
+        out["package_score"] = 0.0
+    return out
+
+
+def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked: dict) -> list:
+    """
+    최종 패키지 품질 보정:
+    - 패키지당 상품 최소 개수 보장
+    - 전체 패키지 최소 개수 보장
+    """
+    global_pool = _build_global_product_pool(reranked)
+    adjusted = []
+    seen_sig = set()
+
+    # 1) 기존 테마 패키지 보정
+    for item in themed_packages:
+        if not isinstance(item, dict):
+            continue
+        theme = item.get("theme") or "밸런스"
+        pkg = item.get("package") or {}
+        if not isinstance(pkg, dict):
+            continue
+        fixed_pkg = _ensure_min_products(pkg, global_pool, MIN_PRODUCTS_PER_PACKAGE)
+        sig = _package_signature(fixed_pkg)
+        if sig and sig in seen_sig:
+            continue
+        if sig:
+            seen_sig.add(sig)
+        adjusted.append({"theme": theme, "package": fixed_pkg})
+
+    # 2) 부족한 패키지 수를 all_packages에서 보강
+    if len(adjusted) < MIN_PACKAGES:
+        for pkg in all_packages:
+            if len(adjusted) >= MIN_PACKAGES:
+                break
+            if not isinstance(pkg, dict):
+                continue
+            fixed_pkg = _ensure_min_products(pkg, global_pool, MIN_PRODUCTS_PER_PACKAGE)
+            sig = _package_signature(fixed_pkg)
+            if sig and sig in seen_sig:
+                continue
+            if sig:
+                seen_sig.add(sig)
+            adjusted.append({"theme": "밸런스", "package": fixed_pkg})
+
+    return adjusted
+
+
 def select_themed_packages(all_packages: list, preferences: list, budget: int) -> list:
     """
     전체 조합 풀에서 테마별로 상위 N_PER_THEME개씩 선별
@@ -196,6 +339,8 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
     themes   = _determine_themes(preferences)
     selected = []
     used_idx = set()
+    # 상품별 등장 횟수 추적: 최대 2회(첫 등장 + 다른 패키지에서 1회 재등장) 허용
+    product_key_counts = {}
 
     for theme in themes:
         scored = sorted(
@@ -207,9 +352,22 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
             key=lambda x: x[1],
             reverse=True,
         )
-        for i, _ in scored[:N_PER_THEME]:
+        picked_in_theme = 0
+        for i, _ in scored:
+            if picked_in_theme >= N_PER_THEME:
+                break
+            candidate_pkg = all_packages[i]
+            candidate_keys = _package_product_keys(candidate_pkg)
+
+            # 상품당 최대 2회까지만 허용 (세 번째 등장부터 스킵)
+            if any(product_key_counts.get(k, 0) >= 2 for k in candidate_keys):
+                continue
+
             used_idx.add(i)
-            selected.append({"theme": theme, "package": all_packages[i]})
+            for k in candidate_keys:
+                product_key_counts[k] = product_key_counts.get(k, 0) + 1
+            selected.append({"theme": theme, "package": candidate_pkg})
+            picked_in_theme += 1
 
     return selected
 
@@ -327,6 +485,7 @@ def run_scoring(
 
     # 3. 테마별 패키지 선별
     themed_packages = select_themed_packages(all_packages, preferences, budget)
+    themed_packages = _enforce_minimum_output(themed_packages, all_packages, reranked)
 
     # 4. 추천 이유 생성 (테마 정보 포함해서 전달)
     if use_llm and themed_packages:
