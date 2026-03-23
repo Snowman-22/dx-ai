@@ -9,18 +9,28 @@ image_score.py
     df_furniture = calc_image_scores(df_furniture, style, engine)
 """
 
+import os
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
-from typing import Optional
 
 
 # ------------------------------------------------------------------ #
 #  인테리어 스타일 벡터 파일 경로
 # ------------------------------------------------------------------ #
 
+def _algorithm_root() -> Path:
+    env_root = os.getenv("RECOMMENDATION_ALGORITHM_PATH", "").strip()
+    if env_root:
+        return Path(env_root)
+    return Path(__file__).resolve().parents[1]
+
+
 # INTERIOR_VECTORS_PATH = r"C:\Users\4243\LGDX\0.Project\3.DX_project\recommendation_algorithm\data\image\interior_style_vectors.npy"
-INTERIOR_VECTORS_PATH = "/data/recommendation_algorithm/file/interior_style_vectors.npy"
+INTERIOR_VECTORS_PATH = _algorithm_root() / "file" / "interior_style_vectors.npy"
 
 # input style 값 → npy 키 매핑
 STYLE_KEY_MAP = {

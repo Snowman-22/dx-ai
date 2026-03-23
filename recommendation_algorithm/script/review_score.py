@@ -7,18 +7,28 @@ review_score.py
     review_profile_match = 0.7 * embedding_similarity + 0.3 * tag_overlap_score
 """
 
+import os
 import pickle
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import text
-from typing import Optional
 
 
 # ── 설정 ────────────────────────────────────────────────────────────
 
+def _algorithm_root() -> Path:
+    env_root = os.getenv("RECOMMENDATION_ALGORITHM_PATH", "").strip()
+    if env_root:
+        return Path(env_root)
+    return Path(__file__).resolve().parents[1]
+
+
 # CLUSTER_MODEL_PATH = r"C:\Users\4243\LGDX\0.Project\3.DX_project\recommendation_algorithm\data\review\review_cluster_model.pkl"
-CLUSTER_MODEL_PATH = "/data/recommendation_algorithm/file/review_cluster_model.pkl"
+CLUSTER_MODEL_PATH = _algorithm_root() / "file" / "review_cluster_model.pkl"
 EMBED_MODEL_NAME   = "jhgan/ko-sroberta-multitask"
 
 # 선택지 → 사용자 프로필 키워드

@@ -79,28 +79,34 @@ def run_pipeline(input_data: dict, engine) -> dict:
     if p["needed_electronics"]:
         df_e = fetch_electronics(engine, p["needed_electronics"])
         df_e = filter_by_budget(df_e, allocated)
+        # 후보 없음 / 스키마 이상 → 가전만 건너뛰고 가구·스코어링은 계속
+        if df_e.empty or "category" not in df_e.columns:
+            pass
+        else:
+            df_e["derived_score"] = df_e.apply(
+                lambda row: calc_electronics_derived_score(
+                    row,
+                    starter_package=p["starter"],
+                    preferences=p["preferences"],
+                    style=p["style"],
+                    category_medians=category_medians,
+                    square_footage=p["square_footage"],
+                ),
+                axis=1,
+            )
 
-        df_e["derived_score"] = df_e.apply(
-            lambda row: calc_electronics_derived_score(
-                row,
-                starter_package=p["starter"],
-                preferences=p["preferences"],
-                style=p["style"],
-                category_medians=category_medians,
-                square_footage=p["square_footage"],
-            ),
-            axis=1,
-        )
+            if df_e.empty or "category" not in df_e.columns:
+                pass
+            else:
+                # ReviewScore 계산
+                df_e = calc_review_scores(df_e, p["starter"], p["preferences"], engine)
 
-        # ReviewScore 계산
-        df_e = calc_review_scores(df_e, p["starter"], p["preferences"], engine)
+                # FinalScore = 0.7 * derived_score + 0.3 * review_score
+                df_e = calc_final_score_electronics(df_e)
 
-        # FinalScore = 0.7 * derived_score + 0.3 * review_score
-        df_e = calc_final_score_electronics(df_e)
-
-        # 카테고리별로 분리해서 반환
-        for cat, df_cat in df_e.groupby("category"):
-            results[cat] = df_cat.sort_values("final_score", ascending=False).reset_index(drop=True)
+                # 카테고리별로 분리해서 반환
+                for cat, df_cat in df_e.groupby("category"):
+                    results[cat] = df_cat.sort_values("final_score", ascending=False).reset_index(drop=True)
 
     # ── 가구 ─────────────────────────────────────────────────────
     if p["needed_furniture"]:
