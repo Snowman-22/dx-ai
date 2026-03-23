@@ -54,6 +54,129 @@ class ChatState(TypedDict, total=False):
 llm_json = ChatOpenAI(model="gpt-4o-mini", temperature=0, response_format={"type": "json_object"})
 llm_text = ChatOpenAI(model="gpt-4o-mini", temperature=0.5)
 
+APPLIANCE_KEYWORDS: dict[str, list[str]] = {
+    "TV": [
+        "tv", "티비", "텔레비전", "oled", "qned", "나노셀", "올레드",
+        "led tv", "qned tv", "울트라hd", "uhd tv", "스탠바이미",
+    ],
+    "에어컨": [
+        "에어컨", "벽걸이에어컨", "스탠드에어컨", "사계절에어컨",
+        "2in1에어컨", "벽걸이형 에어컨", "스탠드형 에어컨", "휘센",
+    ],
+    "세탁기": [
+        "세탁기", "드럼세탁기", "드럼 세탁기", "통돌이세탁기", "통돌이 세탁기",
+        "통돌이", "미니워시", "워시타워", "워시콤보", "트롬 세탁기",
+    ],
+    "건조기": [
+        "건조기", "의류건조기", "의류 건조기", "트롬 건조기", "건조기세트",
+    ],
+    "냉장고": [
+        "냉장고", "양문형냉장고", "양문형 냉장고", "일반냉장고", "일반 냉장고",
+        "김치냉장고", "김치 냉장고", "냉동고", "프렌치도어", "매직스페이스",
+        "더블매직스페이스", "노크온", "디오스", "무드업",
+    ],
+    "공기청정기": [
+        "공기청정기", "공청기", "에어로타워", "퓨리케어", "퓨리케어 공기청정기",
+    ],
+    "정수기": [
+        "정수기", "얼음정수기", "냉온정수기", "냉온정", "냉정수기", "온정수기",
+        "정수전용", "정수기기", "퓨리케어 정수기",
+    ],
+    "청소기": [
+        "청소기", "로봇청소기", "무선청소기", "유선청소기", "스틱청소기",
+        "코드제로", "로보킹", "사이킹",
+    ],
+    "제습기": [
+        "제습기", "대용량제습기", "소형제습기",
+    ],
+    "가습기": [
+        "가습기", "자연기화 가습기", "하이드로타워", "하이드로에센셜",
+    ],
+    "식기세척기": [
+        "식기세척기", "식세기", "빌트인 식기세척기", "프리스탠딩 식기세척기",
+    ],
+    "전기레인지": [
+        "전기레인지", "인덕션", "하이브리드레인지", "레인지", "빌트인 레인지",
+    ],
+    "전자레인지": [
+        "전자레인지", "전자 레인지", "광파오븐", "광파 오븐", "오븐", "전자오븐",
+    ],
+    "의류관리기": [
+        "의류관리기", "스타일러", "스티머", "의류 케어기",
+    ],
+    "밥솥": [
+        "밥솥", "전기밥솥", "압력밥솥", "쿠쿠 밥솥",
+    ],
+}
+
+FURNITURE_KEYWORDS: dict[str, list[str]] = {
+    "소파": [
+        "소파", "1인소파", "2인소파", "3인소파", "4인소파", "모듈소파",
+        "카우치소파", "패브릭소파", "가죽소파", "리클라이너", "전동리클라이너",
+        "리클라이너소파", "코너소파", "벤치소파", "키즈소파",
+    ],
+    "의자": [
+        "의자", "체어", "다이닝체어", "식탁의자", "데스크체어", "컴퓨터의자",
+        "사무의자", "학생의자", "바스툴", "홈바의자", "화장대의자",
+        "암체어", "라운지체어", "패브릭체어", "가죽체어", "스툴", "유아의자",
+    ],
+    "침대": [
+        "침대", "패브릭침대", "가죽침대", "저상형침대", "패밀리침대", "데이베드",
+        "가드침대", "유아침대", "싱글침대", "슈퍼싱글침대", "퀸침대",
+        "킹침대", "라지킹침대",
+    ],
+    "매트리스": [
+        "매트리스", "토퍼", "스프링매트리스", "라텍스매트리스",
+        "싱글 매트리스", "퀸 매트리스", "킹 매트리스",
+    ],
+    "식탁": [
+        "식탁", "세라믹식탁", "원형식탁", "타원형식탁", "4인식탁", "6인식탁",
+        "2인식탁", "다이닝테이블", "원목식탁", "마블식탁",
+    ],
+    "테이블": [
+        "테이블", "사이드테이블", "티테이블", "소파테이블", "소파탁자",
+        "거실테이블", "커피테이블", "야외테이블",
+    ],
+    "수납장": [
+        "수납장", "서랍장", "장식장", "진열장", "선반장", "수납선반", "와이드서랍장",
+        "사이드보드", "이동식수납", "캐비닛", "콘솔장",
+    ],
+    "책장": [
+        "책장", "북케이스", "오픈책장", "책꽂이",
+    ],
+    "옷장": [
+        "옷장", "행거형옷장", "서랍형옷장", "거울옷장", "붙박이장",
+    ],
+    "책상": [
+        "책상", "데스크", "서재책상", "컴퓨터책상", "학생책상", "1인책상",
+        "파티션책상", "작업책상",
+    ],
+    "거실장": [
+        "거실장", "tv거실장", "tv장", "tv콘솔", "tv캐비넷", "tv선반", "미디어콘솔",
+    ],
+    "행거": [
+        "행거", "옷행거", "코트행거", "드레스룸", "스탠드행거",
+    ],
+    "선반": [
+        "선반", "벽선반", "모니터선반", "책상선반", "수납선반",
+    ],
+    "화장대": [
+        "화장대", "거울화장대", "콘솔", "콘솔선반",
+    ],
+    "협탁": [
+        "협탁", "침대협탁", "사이드협탁",
+    ],
+    "트롤리": [
+        "트롤리", "이동식트롤리", "카트형 수납장",
+    ],
+    "벤치": [
+        "벤치", "벤치의자", "벤치소파",
+    ],
+    "아웃도어가구": [
+        "아웃도어가구", "야외의자", "야외테이블", "테라스가구",
+    ],
+}
+
 # --- 헬퍼 함수들 ---
 def _to_str(x: Any) -> str:
     return str(x).strip() if x is not None else ""
@@ -425,6 +548,76 @@ def _extract_needed_list(user_text: Any) -> List[str]:
     return [s]
 
 
+def _unique_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        key = _to_str(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _match_keywords(text: str, mapping: dict[str, list[str]]) -> list[str]:
+    lowered = _to_str(text).lower()
+    matched: list[str] = []
+    for canonical, aliases in mapping.items():
+        for alias in aliases:
+            if alias.lower() in lowered:
+                matched.append(canonical)
+                break
+    return _unique_keep_order(matched)
+
+
+async def _classify_chat5_items(user_text: Any) -> dict[str, list[str]]:
+    text = _to_str(user_text)
+    if not text:
+        return {"appliances": [], "furniture": []}
+
+    appliances = _match_keywords(text, APPLIANCE_KEYWORDS)
+    furniture = _match_keywords(text, FURNITURE_KEYWORDS)
+
+    # 룰베이스로 못 잡은 경우에만 OpenAI에 "추출/정규화"만 맡깁니다.
+    if appliances or furniture:
+        return {"appliances": appliances, "furniture": furniture}
+
+    prompt = f"""
+사용자 문장에서 가전/가구 품목명만 추출해서 JSON으로 반환하세요.
+- 새 품목을 상상하지 마세요.
+- 문장에 직접 언급된 품목만 추출하세요.
+- 없으면 빈 배열을 반환하세요.
+- 가능한 경우 아래 정규 품목명 중 하나로 맞추세요.
+
+가전 후보: {list(APPLIANCE_KEYWORDS.keys())}
+가구 후보: {list(FURNITURE_KEYWORDS.keys())}
+
+반환 형식:
+{{
+  "appliances": ["품목명"],
+  "furniture": ["품목명"]
+}}
+
+사용자 문장:
+\"\"\"{text}\"\"\"
+""".strip()
+
+    try:
+        resp = await llm_json.ainvoke(prompt)
+        parsed = _extract_json_from_llm_response(resp)
+    except Exception:
+        return {"appliances": appliances, "furniture": furniture}
+
+    appliances = _unique_keep_order(
+        [x for x in parsed.get("appliances", []) if _to_str(x) in APPLIANCE_KEYWORDS]
+    )
+    furniture = _unique_keep_order(
+        [x for x in parsed.get("furniture", []) if _to_str(x) in FURNITURE_KEYWORDS]
+    )
+    return {"appliances": appliances, "furniture": furniture}
+
+
 def _dict_has_needed_key(d: dict) -> bool:
     return any(
         k in d
@@ -552,7 +745,7 @@ def node_chat_4(state: ChatState) -> ChatState:
     }
 
 
-def node_chat_5(state: ChatState) -> ChatState:
+async def node_chat_5(state: ChatState) -> ChatState:
     """CHAT_5: 새 공간용 구매 계획(가구/가전) 자유 텍스트."""
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
@@ -560,9 +753,17 @@ def node_chat_5(state: ChatState) -> ChatState:
         user_info["purchase_plans"] = ", ".join(_to_str(x) for x in user_text)
     else:
         user_info["purchase_plans"] = user_text
-    furniture_needed = _extract_needed_list(user_text)
-    if furniture_needed:
-        user_info["furniture_needed"] = furniture_needed
+
+    classified = await _classify_chat5_items(user_text)
+    classified_appliances = classified.get("appliances") or []
+    classified_furniture = classified.get("furniture") or []
+
+    if classified_appliances:
+        existing = _unique_keep_order(_extract_needed_list(user_info.get("needed_appliances")))
+        user_info["needed_appliances"] = _unique_keep_order(existing + classified_appliances)
+    if classified_furniture:
+        user_info["furniture_needed"] = classified_furniture
+
     if _to_str(user_info.get("purchase_plans")):
         user_info["need_furniture"] = True
     return {
