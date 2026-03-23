@@ -172,6 +172,7 @@ def create_app() -> FastAPI:
             "CHAT_2",
             "CHAT_3",
             "CHAT_4",
+            "CHAT_7",
             "CHAT_5",
         }:
             if isinstance(data, dict) and not data and "error" not in data:

@@ -26,12 +26,13 @@ logger = logging.getLogger(__name__)
 
 class ChatStep(str, Enum):
     # UI 순서(프론트 이미지 기준)
-    # 평수 → 보유/필요 가전 → 가구 필요여부 → 인테리어 스타일 → 라이프스타일/취향 → 예산 → 추천
+    # 평수 → 보유/필요 가전 → 가구 필요여부 → 인테리어 스타일 → (선택) 가구 리스트 입력 → 라이프스타일/취향 → 예산 → 추천
     CHAT_0 = "CHAT_0"  # 평수(초기 질문)
     CHAT_1 = "CHAT_1"  # (프론트에서 스킵될 수 있는 내부 단계)
     CHAT_2 = "CHAT_2"  # 보유 + 필요(필수) 가전 — owned/needed
     CHAT_3 = "CHAT_3"  # 가구/인테리어 소품 필요여부
     CHAT_4 = "CHAT_4"  # 인테리어 스타일(모던/내추럴/컬러풀 등)
+    CHAT_7 = "CHAT_7"  # 가구명 리스트 입력(모달)
     CHAT_5 = "CHAT_5"  # 라이프스타일/취향(칩)
     CHAT_6 = "CHAT_6"  # 예산
     CHAT_RESULT = "CHAT_RESULT"  # 추천 결과(내부 상태)
@@ -817,6 +818,41 @@ def node_chat_4(state: ChatState) -> ChatState:
 
     return {
         **state,
+        "step": ChatStep.CHAT_7,
+        "user_info": user_info,
+        "data": {},
+        "ai_response": None,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
+
+
+def node_chat_7(state: ChatState) -> ChatState:
+    """CHAT_7: 가구명 리스트(모달) 입력."""
+    user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+
+    # 리스트형을 우선 지원, 문자열도 방어적으로 처리
+    items: list[str] = []
+    if isinstance(user_text, list):
+        items = _unique_keep_order([_to_str(x) for x in user_text if _to_str(x)])
+    elif isinstance(user_text, str):
+        s = user_text.strip()
+        if s:
+            if "," in s:
+                items = _unique_keep_order([x.strip() for x in s.split(",") if x.strip()])
+            else:
+                items = [s]
+
+    if items:
+        user_info["furniture_needed"] = items
+        user_info["need_furniture"] = True
+    else:
+        # 빈 값이면 기존 값을 유지하되, 키가 전혀 없으면 빈 리스트로 초기화
+        if "furniture_needed" not in user_info:
+            user_info["furniture_needed"] = []
+
+    return {
+        **state,
         "step": ChatStep.CHAT_5,
         "user_info": user_info,
         "data": {},
@@ -1413,6 +1449,7 @@ async def dispatch_node(state: ChatState) -> ChatState:
         "CHAT_2": node_chat_2,
         "CHAT_3": node_chat_3,
         "CHAT_4": node_chat_4,
+        "CHAT_7": node_chat_7,
         "CHAT_5": node_chat_5,
         "CHAT_6": node_chat_6,
         "CHAT_11": node_chat_11,
