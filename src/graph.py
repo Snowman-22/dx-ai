@@ -238,6 +238,54 @@ def _compute_budget_breakdown(item: Dict[str, Any]) -> Dict[str, Any]:
         "furniture_price_sum": _to_int_price(item.get("price")),
     }
 
+
+def _package_items(pkg: Dict[str, Any]) -> list[Dict[str, Any]]:
+    items: list[Dict[str, Any]] = []
+    appliances = pkg.get("appliances")
+    furniture = pkg.get("furniture")
+
+    if isinstance(appliances, list) or isinstance(furniture, list):
+        for raw in (appliances, furniture):
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        items.append(item)
+        return items
+
+    products = pkg.get("products")
+    if isinstance(products, list):
+        for item in products:
+            if isinstance(item, dict):
+                items.append(item)
+    return items
+
+
+def _package_signature(pkg: Dict[str, Any]) -> tuple[str, ...]:
+    keys: list[str] = []
+    for item in _package_items(pkg):
+        ident = (
+            _to_str(item.get("product_id"))
+            or _to_str(item.get("model_id"))
+            or _to_str(item.get("product_name"))
+            or _to_str(item.get("name"))
+        )
+        if ident:
+            keys.append(ident)
+    return tuple(sorted(set(keys)))
+
+
+def _sanitize_package_for_response(pkg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "package_name": pkg.get("package_name") or pkg.get("theme") or pkg.get("name") or "",
+        "recommendationReason": (
+            pkg.get("recommendationReason")
+            or pkg.get("reason")
+            or ""
+        ),
+        "appliances": pkg.get("appliances") if isinstance(pkg.get("appliances"), list) else [],
+        "furniture": pkg.get("furniture") if isinstance(pkg.get("furniture"), list) else [],
+    }
+
 def _append_message(state: ChatState, *, role: str, content: Any) -> List[Dict[str, Any]]:
     messages = list(state.get("messages") or [])
     messages.append({"role": role, "content": content})
@@ -804,9 +852,15 @@ async def node_chat_result(state: ChatState) -> ChatState:
     try:
         result = await generate_recommendation_result(user_info=user_info)
         recommendation_list = []
+        seen_signatures: set[tuple[str, ...]] = set()
         for item in result.recommendation_list:
             if isinstance(item, dict):
-                recommendation_list.append(item)
+                sig = _package_signature(item)
+                if sig and sig in seen_signatures:
+                    continue
+                if sig:
+                    seen_signatures.add(sig)
+                recommendation_list.append(_sanitize_package_for_response(item))
     except NotImplementedError:
         return {
             **state,
@@ -966,9 +1020,9 @@ async def _execute_floor_plan_package_rag(
     user_info["last_placement_payload"] = payload
 
     model_ids: List[str] = []
-    products = pkg.get("products") or []
-    if isinstance(products, list):
-        for p in products:
+    items = _package_items(pkg)
+    if isinstance(items, list):
+        for p in items:
             if isinstance(p, dict):
                 mid = p.get("model_id")
                 if mid:
@@ -1095,7 +1149,7 @@ def _find_model_ids_by_product_name(
     for pi, pkg in enumerate(all_recs):
         if not isinstance(pkg, dict):
             continue
-        products = pkg.get("products") or []
+        products = _package_items(pkg)
         if not isinstance(products, list):
             continue
         for p in products:
@@ -1167,7 +1221,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             pkg = all_recs[package_idx]
             if isinstance(pkg, dict):
                 model_ids = []
-                products = pkg.get("products") or []
+                products = _package_items(pkg)
                 if isinstance(products, list):
                     for p in products:
                         if isinstance(p, dict):
