@@ -85,8 +85,6 @@ jobs:
               --restart unless-stopped \
               -p 8000:8000 \
               --env-file /home/${{ secrets.EC2_USERNAME }}/fastapi_snowman.env \
-              -e RECOMMENDATION_ALGORITHM_PATH=/data/recommendation_algorithm \
-              -v /data/recommendation_algorithm:/data/recommendation_algorithm:ro \
               fastapi_snowman_image:latest
 
             sleep 5

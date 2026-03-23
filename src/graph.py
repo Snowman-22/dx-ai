@@ -800,24 +800,13 @@ def node_chat_11(state: ChatState) -> ChatState:
 async def node_chat_result(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
     messages = list(state.get("messages") or [])
-    budget_max_won = _get_budget_max_won(user_info)
 
     try:
         result = await generate_recommendation_result(user_info=user_info)
-        full_recommendation_list = []
+        recommendation_list = []
         for item in result.recommendation_list:
             if isinstance(item, dict):
-                full_recommendation_list.append(item)
-                continue
-            full_recommendation_list.append({
-                "category": getattr(item, "category", None),
-                "package_name": getattr(item, "package_name", None),
-                "name": getattr(item, "package_name", getattr(item, "name", "")) or getattr(item, "name", ""),
-                "products": getattr(item, "products", None),
-                "reason": getattr(item, "reason", None),
-                "estimated_price": getattr(item, "estimated_price", None),
-            })
-        total_estimated_budget = result.total_estimated_budget
+                recommendation_list.append(item)
     except NotImplementedError:
         return {
             **state,
@@ -841,88 +830,11 @@ async def node_chat_result(state: ChatState) -> ChatState:
             "is_completed": False,
         }
 
-    if not isinstance(full_recommendation_list, list):
-        full_recommendation_list = []
-
-    # RDS product 테이블에 없는 항목은 절대 내려보내지 않음 (LLM/오염된 필드 제거)
-    catalog_by_pid, catalog_by_mid = await fetch_recommendation_catalog_maps(full_recommendation_list)
-    catalog_by_name: Dict[str, Dict[str, Any]] = {}
-
-    # 추천 이유 문자열은 알고리즘/DB 결과만 사용(LLM으로 패키지 문구 생성 안 함).
-    for item in full_recommendation_list:
-        if isinstance(item, dict):
-            item.setdefault("name", item.get("package_name") or item.get("name") or item.get("title") or "")
-            raw_products = item.get("products") or []
-            item["products"] = _enforce_products_from_catalog(
-                raw_products,
-                catalog_by_model_id=catalog_by_mid,
-                catalog_by_name=catalog_by_name,
-                catalog_by_product_id=catalog_by_pid if catalog_by_pid else None,
-                strict=True,
-            )
-
-            # 예산 상한(일시불 기준) 적용: 패키지 총액이 상한을 넘지 않도록 제품 컷오프
-            if isinstance(item.get("products"), list):
-                item["products"] = _apply_budget_cap_to_products(
-                    item["products"],
-                    budget_max_won=budget_max_won,
-                )
-            item.update(_compute_budget_breakdown(item))
-            # GUI-2 추천 카드 렌더 편의를 위해 제품을 가전/가구/소품으로 분리합니다.
-            products = item.get("products") or []
-            appliances: list[dict[str, Any]] = []
-            furniture: list[dict[str, Any]] = []
-            if isinstance(products, list):
-                for p in products:
-                    if not isinstance(p, dict):
-                        continue
-                    p_cat = p.get("category")
-                    if p_cat == "appliance":
-                        appliances.append(p)
-                    elif p_cat == "furniture":
-                        furniture.append(p)
-                    else:
-                        # category가 불명확한 경우, price_normal/price_subscription 존재를 기준으로 분류
-                        if "price_normal" in p or "price_subscription" in p:
-                            appliances.append(p)
-                        else:
-                            furniture.append(p)
-            item["appliances"] = appliances
-            item["furniture"] = furniture
-            item["reason"] = item.get("reason") or ""
-
-    # 검증 후 상품이 하나도 없는 패키지는 제거
-    full_recommendation_list = [
-        item
-        for item in full_recommendation_list
-        if isinstance(item, dict)
-        and isinstance(item.get("products"), list)
-        and len(item["products"]) > 0
-    ]
-
-    if not full_recommendation_list:
-        return {
-            **state,
-            "step": ChatStep.CHAT_6,
-            "data": {
-                "error": (
-                    "추천 결과에 포함된 상품이 RDS `product` 테이블에서 확인되지 않았습니다. "
-                    "product_id·model_id가 없거나 DB에 없는 행이면 응답에서 제외됩니다."
-                ),
-            },
-            "messages": messages,
-            "is_completed": False,
-        }
-
-    display_recommendations = full_recommendation_list[:3]
-    next_index = len(display_recommendations)
-
     messages.append({
         "role": "assistant",
         "content": {
             "type": "recommendation_result",
-            "display_recommendations": display_recommendations,
-            "total_estimated_budget": total_estimated_budget,
+            "recommendation_list": recommendation_list,
         },
     })
 
@@ -930,14 +842,12 @@ async def node_chat_result(state: ChatState) -> ChatState:
         **state,
         "step": ChatStep.CHAT_RESULT,
         "data": {
-            "all_recommendations": full_recommendation_list,
-            "display_recommendations": display_recommendations,
-            "next_index": next_index,
-            "total_estimated_budget": total_estimated_budget,
+            "recommendation_list": recommendation_list,
         },
         "messages": messages,
         "is_completed": True,
     }
+
 
 
 def _parse_recommend_rag_user_input(user_text: Any) -> tuple[str, Optional[int]]:
@@ -1009,7 +919,7 @@ async def _execute_floor_plan_package_rag(
     if not isinstance(utilities, list):
         utilities = []
 
-    all_recs = new_data.get("all_recommendations") or []
+    all_recs = new_data.get("recommendation_list") or []
     if not isinstance(all_recs, list) or not all_recs:
         err = "추천 패키지가 없습니다. 같은 convId로 CHAT_6(추천 리스트)를 먼저 완료해 주세요."
         return {
@@ -1173,7 +1083,7 @@ def _find_model_ids_by_product_name(
     max_models: int = 5,
 ) -> tuple[List[str], Optional[int]]:
     """
-    all_recommendations 안의 product_name/name과 질문을 매칭해 model_id 목록.
+    recommendation_list 안의 product_name/name과 질문을 매칭해 model_id 목록.
     Returns (model_ids, 대표 패키지 인덱스 또는 None).
     """
     if not isinstance(all_recs, list) or not _to_str(question).strip():
@@ -1252,7 +1162,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
 
     prompt = None
     if package_idx is not None:
-        all_recs = new_data.get("all_recommendations") or []
+        all_recs = new_data.get("recommendation_list") or []
         if isinstance(all_recs, list) and 0 <= package_idx < len(all_recs):
             pkg = all_recs[package_idx]
             if isinstance(pkg, dict):
@@ -1287,9 +1197,9 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                     except Exception:
                         prompt = None
 
-    # 패키지 인덱스 없이 질문에 상품명이 있으면 all_recommendations에서 매칭 → DB 스펙
+    # 패키지 인덱스 없이 질문에 상품명이 있으면 recommendation_list에서 매칭 → DB 스펙
     if prompt is None:
-        all_recs = new_data.get("all_recommendations") or []
+        all_recs = new_data.get("recommendation_list") or []
         mids_name, pkg_by_name = _find_model_ids_by_product_name(question_str, all_recs)
         if mids_name:
             try:

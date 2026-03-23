@@ -107,26 +107,33 @@ def run_pipeline(input_data: dict, engine) -> dict:
         df_f = fetch_furniture(engine, p["needed_furniture"])
         df_f = filter_by_budget(df_f, allocated)
 
-        df_f["derived_score"] = df_f.apply(
-            lambda row: calc_furniture_derived_score(
-                row,
-                starter_package=p["starter"],
-                preferences=p["preferences"],
-                style=p["style"],
-                category_medians=category_medians,
-            ),
-            axis=1,
-        )
+        # 후보 없음 / 스키마 이상 → 가구만 건너뛰고 가전·스코어링은 계속
+        if df_f.empty or "category" not in df_f.columns:
+            pass
+        else:
+            df_f["derived_score"] = df_f.apply(
+                lambda row: calc_furniture_derived_score(
+                    row,
+                    starter_package=p["starter"],
+                    preferences=p["preferences"],
+                    style=p["style"],
+                    category_medians=category_medians,
+                ),
+                axis=1,
+            )
 
-        # ImageScore 계산
-        df_f = calc_image_scores(df_f, p["style"], engine)
+            if df_f.empty or "category" not in df_f.columns:
+                pass
+            else:
+                # ImageScore 계산
+                df_f = calc_image_scores(df_f, p["style"], engine)
 
-        # FinalScore = 0.6 * derived_score + 0.4 * image_score
-        df_f = calc_final_score_furniture(df_f)
+                # FinalScore = 0.6 * derived_score + 0.4 * image_score
+                df_f = calc_final_score_furniture(df_f)
 
-        # 카테고리별로 분리해서 반환
-        for cat, df_cat in df_f.groupby("category"):
-            results[cat] = df_cat.sort_values("final_score", ascending=False).reset_index(drop=True)
+                # 카테고리별로 분리해서 반환
+                for cat, df_cat in df_f.groupby("category"):
+                    results[cat] = df_cat.sort_values("final_score", ascending=False).reset_index(drop=True)
 
     return results
 
