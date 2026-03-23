@@ -129,6 +129,15 @@ def calc_image_scores(
     """
     df = df.copy()
 
+    # 일부 입력 조합에서 빈 DF 또는 예상과 다른 컬럼 구조가 들어올 수 있다.
+    # 이 경우 이미지 점수는 중립값으로 두고 전체 추천 파이프라인은 계속 진행한다.
+    if df.empty:
+        df["image_score"] = pd.Series(dtype=float)
+        return df
+    if "product_id" not in df.columns:
+        df["image_score"] = 0.5
+        return df
+
     # 스타일 미선택 or 벡터 파일 없으면 중립값
     style_vec = load_style_vector(style) if style else None
     if style_vec is None:
