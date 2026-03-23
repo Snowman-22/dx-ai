@@ -25,14 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class ChatStep(str, Enum):
-    # UI 순서: 예산 → 평수 → 라이프스타일 → 보유+필요 가전(한 단계) → 구매계획 → 추천
-    CHAT_0 = "CHAT_0"  # 진단 시작(인트로)
-    CHAT_1 = "CHAT_1"  # 총 예산(만원, 숫자)
-    CHAT_2 = "CHAT_2"  # 평수(칩/텍스트)
-    CHAT_3 = "CHAT_3"  # 라이프스타일(칩/텍스트)
-    CHAT_4 = "CHAT_4"  # 보유 + 필요(필수) 가전 — 한 요청(owned/needed)
-    CHAT_5 = "CHAT_5"  # 구매 계획(가구/가전 텍스트)
-    CHAT_6 = "CHAT_6"  # 추천 리스트 생성
+    # UI 순서(프론트 이미지 기준)
+    # 평수 → 보유/필요 가전 → 가구 필요여부 → 인테리어 스타일 → 라이프스타일/취향 → 예산 → 추천
+    CHAT_0 = "CHAT_0"  # 평수(초기 질문)
+    CHAT_1 = "CHAT_1"  # (프론트에서 스킵될 수 있는 내부 단계)
+    CHAT_2 = "CHAT_2"  # 보유 + 필요(필수) 가전 — owned/needed
+    CHAT_3 = "CHAT_3"  # 가구/인테리어 소품 필요여부
+    CHAT_4 = "CHAT_4"  # 인테리어 스타일(모던/내추럴/컬러풀 등)
+    CHAT_5 = "CHAT_5"  # 라이프스타일/취향(칩)
+    CHAT_6 = "CHAT_6"  # 예산
     CHAT_RESULT = "CHAT_RESULT"  # 추천 결과(내부 상태)
     RECOMMEND_RAG = "RECOMMEND_RAG"  # 추천 이후 일반 질의(도면·배치 없음)
     BLUEPRINT_RAG = "BLUEPRINT_RAG"  # 도면 단계: 선택 도면 + 패키지 + 스티커 좌표 RAG
@@ -690,33 +691,56 @@ def _get_needed_raw_from_dict(d: dict) -> Any:
 # --- 노드 정의 ---
 
 def node_chat_0(state: ChatState) -> ChatState:
-    return {**state, "step": ChatStep.CHAT_1, "data": {}, "is_completed": False}
+    """CHAT_0: 평수(칩/텍스트)."""
+    user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+    if user_text is not None:
+        user_info["size"] = user_text
+
+    return {
+        **state,
+        "step": ChatStep.CHAT_2,
+        "user_info": user_info,
+        "data": {},
+        "ai_response": None,
+        "is_completed": False,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
 
 
 def node_chat_1(state: ChatState) -> ChatState:
-    """CHAT_1: 총 예산(만원, 숫자 등) — UI 첫 입력."""
+    """
+    CHAT_1: 프론트 흐름상 스킵될 수 있는 내부 단계.
+    (예산은 CHAT_6에서 처리)
+    """
     user_text = state.get("last_user_input")
-    user_info = dict(state.get("user_info") or {})
-    try:
-        parsed = _parse_budget(user_text)
-        user_info.update(parsed)
-        return {
-            **state,
-            "step": ChatStep.CHAT_2,
-            "user_info": user_info,
-            "data": {},
-            "ai_response": None,
-            "messages": _append_message(state, role="user", content=user_text),
-        }
-    except ValueError:
-        return {**state, "step": ChatStep.CHAT_1, "data": {"error": "예산을 다시 입력해주세요."}, "messages": _append_message(state, role="user", content=user_text)}
+    return {
+        **state,
+        "step": ChatStep.CHAT_2,
+        "data": {},
+        "ai_response": None,
+        "is_completed": False,
+        "messages": _append_message(state, role="user", content=user_text),
+    }
 
 
 def node_chat_2(state: ChatState) -> ChatState:
-    """CHAT_2: 평수 (10평 이하 / 10~20평 … 또는 텍스트)."""
+    """CHAT_2: 보유 + 필요 가전(owned/needed)."""
     user_text = state.get("last_user_input")
+    user_text = _coerce_chat4_user_text(user_text)
     user_info = dict(state.get("user_info") or {})
-    user_info["size"] = user_text
+
+    if isinstance(user_text, dict):
+        if "owned" in user_text:
+            user_info["owned_appliances"] = _extract_owned_list({"owned": user_text.get("owned")})
+        if _dict_has_needed_key(user_text):
+            user_info["needed_appliances"] = _extract_needed_list(
+                {"needed": _get_needed_raw_from_dict(user_text)}
+            )
+    else:
+        # 프론트가 문자열로만 보내는 경우(방어)
+        user_info["needed_appliances"] = _extract_needed_list(user_text)
+
     return {
         **state,
         "step": ChatStep.CHAT_3,
@@ -728,13 +752,19 @@ def node_chat_2(state: ChatState) -> ChatState:
 
 
 def node_chat_3(state: ChatState) -> ChatState:
-    """CHAT_3: 라이프스타일 (칩 다중 선택 시 list 가능)."""
+    """CHAT_3: 가구/인테리어 소품 필요여부(예/아니오)."""
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
-    if isinstance(user_text, list):
-        user_info["lifestyle"] = ", ".join(_to_str(x) for x in user_text)
-    else:
-        user_info["lifestyle"] = user_text
+
+    t = _to_str(user_text).strip()
+    t_lower = t.lower()
+    is_yes = any(k in t_lower for k in ("네", "예", "응", "추천", "해주세요", "원해", "좋아"))
+    is_no = any(k in t_lower for k in ("아직", "필요없", "필요 없", "필요없어요", "아뇨", "아니", "안해", "원치"))
+
+    need_furniture = bool(is_yes and not is_no)
+    user_info["need_furniture"] = need_furniture
+    user_info["furniture_needed"] = ["가구", "인테리어 소품"] if need_furniture else []
+
     return {
         **state,
         "step": ChatStep.CHAT_4,
@@ -771,18 +801,20 @@ def _coerce_chat4_user_text(user_text: Any) -> Any:
 
 
 def node_chat_4(state: ChatState) -> ChatState:
-    """CHAT_4: 보유 + 필요(필수) 가전 — owned / needed 를 한 요청에."""
-    user_text = _coerce_chat4_user_text(state.get("last_user_input"))
+    """CHAT_4: 인테리어 스타일 선택(예: 모던/미니멀, 내추럴/우드)."""
+    user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
-    if isinstance(user_text, dict):
-        if "owned" in user_text:
-            user_info["owned_appliances"] = _extract_owned_list({"owned": user_text.get("owned")})
-        if _dict_has_needed_key(user_text):
-            user_info["needed_appliances"] = _extract_needed_list(
-                {"needed": _get_needed_raw_from_dict(user_text)}
-            )
-    else:
-        user_info["needed_appliances"] = _extract_needed_list(user_text)
+
+    # CHAT_3에서 "가구/인테리어 소품 추천 필요 없음"이면 CHAT_4가 와도
+    # interior_style은 오염되지 않게 무시합니다.
+    need_furniture = bool(user_info.get("need_furniture"))
+    if need_furniture:
+        style_val = _to_str(user_text).strip()
+        # 프론트가 실수로 '네/아니오' 같은 값을 그대로 넘기는 경우를 방어
+        yes_no_like = any(k in style_val for k in ("네", "예", "응", "아니", "아뇨", "필요없"))
+        if style_val and not yes_no_like:
+            user_info["interior_style"] = style_val
+
     return {
         **state,
         "step": ChatStep.CHAT_5,
@@ -794,26 +826,19 @@ def node_chat_4(state: ChatState) -> ChatState:
 
 
 async def node_chat_5(state: ChatState) -> ChatState:
-    """CHAT_5: 새 공간용 구매 계획(가구/가전) 자유 텍스트."""
+    """CHAT_5: 라이프스타일/취향(칩 다중 선택)."""
     user_text = state.get("last_user_input")
     user_info = dict(state.get("user_info") or {})
+
     if isinstance(user_text, list):
-        user_info["purchase_plans"] = ", ".join(_to_str(x) for x in user_text)
+        # 파이프라인이 lifestyle을 ','로 split 하므로 문자열로 join
+        user_info["lifestyle"] = ", ".join(_to_str(x) for x in user_text if _to_str(x))
     else:
-        user_info["purchase_plans"] = user_text
+        user_info["lifestyle"] = _to_str(user_text)
 
-    classified = await _classify_chat5_items(user_text)
-    classified_appliances = classified.get("appliances") or []
-    classified_furniture = classified.get("furniture") or []
+    # 여기서는 “취향/라이프스타일”만 받으므로 purchase_plans는 제거(오염 방지)
+    user_info.pop("purchase_plans", None)
 
-    if classified_appliances:
-        existing = _unique_keep_order(_extract_needed_list(user_info.get("needed_appliances")))
-        user_info["needed_appliances"] = _unique_keep_order(existing + classified_appliances)
-    if classified_furniture:
-        user_info["furniture_needed"] = classified_furniture
-
-    if _to_str(user_info.get("purchase_plans")):
-        user_info["need_furniture"] = True
     return {
         **state,
         "step": ChatStep.CHAT_6,
@@ -825,15 +850,36 @@ async def node_chat_5(state: ChatState) -> ChatState:
 
 
 async def node_chat_6(state: ChatState) -> ChatState:
-    """CHAT_6: 추천 리스트 생성."""
+    """CHAT_6: 예산 파싱 후 추천 리스트 생성."""
     user_text = state.get("last_user_input")
+    user_info = dict(state.get("user_info") or {})
+
+    try:
+        parsed = _parse_budget(user_text)
+        user_info.update(parsed)
+    except ValueError:
+        # 예산 입력이 이상한 경우
+        return {
+            **state,
+            "step": ChatStep.CHAT_6,
+            "data": {"error": "예산을 다시 입력해주세요."},
+            "ai_response": None,
+            "is_completed": False,
+            "messages": _append_message(state, role="user", content=user_text),
+        }
+
+    # 추천 생성 전에 사용자 입력을 메시지로 남김
     if user_text is not None:
         state = {
             **state,
+            "user_info": user_info,
             "data": {},
             "ai_response": None,
             "messages": _append_message(state, role="user", content=user_text),
         }
+    else:
+        state = {**state, "user_info": user_info, "data": {}, "ai_response": None}
+
     return await node_chat_result(state)
 
 
