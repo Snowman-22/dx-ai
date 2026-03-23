@@ -102,7 +102,6 @@ async def fetch_products_bundle_details(
                         "width": spec.width,
                         "height": spec.height,
                         "depth": spec.depth,
-                        "weight": spec.weight,
                     }
                 ),
                 "subscribe_prices": [

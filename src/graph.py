@@ -1305,13 +1305,27 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
     # Spring/프론트 편의 (동일 의미)
     new_data["showNextRecommendationPage"] = show_next
 
+    # 중요:
+    # RECOMMEND_RAG에서 LLM이 "다음 페이지"를 요청하지 않는 경우에는
+    # 프론트가 이미 가지고 있는 추천 리스트를 그대로 쓰면 되므로,
+    # 응답 payload에 recommendation_list 전체를 다시 실어 보내지 않는다.
+    # (그래야 chat 응답(i.e. aiResponse)만 갱신되고 리스트 UI가 "다시" 뜨지 않음)
+    response_data = dict(new_data)
+    # 프론트에서 paging 의도를 판단할 때 굳이 플래그가 필요 없으므로 제거
+    response_data.pop("show_next_recommendation_page", None)
+    response_data.pop("showNextRecommendationPage", None)
+    if not show_next:
+        response_data.pop("recommendation_list", None)
+        response_data.pop("recommendations", None)
+        response_data.pop("recommendationList", None)
+
     messages.append({"role": "assistant", "content": answer_text})
     return {
         **state,
         "step": ChatStep.RECOMMEND_RAG,
         "ai_response": answer_text,
         "messages": messages,
-        "data": new_data,
+        "data": response_data,
         "is_completed": True,
     }
 

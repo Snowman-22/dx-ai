@@ -1,4 +1,7 @@
 import os
+import sys
+import logging
+import json
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -48,6 +51,17 @@ class ChatResponse(BaseModel):
 def create_app() -> FastAPI:
     app = FastAPI(title="FastAPI LangGraph Chatbot")
 
+    # Docker 로그(stdout)로 남기기 위한 로깅 설정
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -83,6 +97,21 @@ def create_app() -> FastAPI:
         # DynamoDB 체크포인터 및 Postgres Chat.conv_id와 동일한 값으로 연결합니다.
         config = {"configurable": {"thread_id": payload.conv_id}}
 
+        def _to_jsonable(x):
+            # pydantic/ORM/기타 객체 직렬화에 대비
+            return x if isinstance(x, (dict, list, str, int, float, bool)) or x is None else str(x)
+
+        # 요청 입력 로깅(요청/입력/merge까지 전부 stdout로 출력)
+        logger = logging.getLogger("fastapi_chat")
+        logger.info(
+            "INCOMING /ai/chat payload(by_alias)=%s",
+            json.dumps(
+                payload.model_dump(by_alias=True),
+                ensure_ascii=False,
+                default=_to_jsonable,
+            ),
+        )
+
         # 입력을 LangGraph용 상태로 변환
         # 중요: checkpointer(DynamoDB/메모리)가 이전 state(user_info 등)를 복구하므로,
         # 여기서 빈 dict로 덮어쓰지 않도록 "이번 턴에 새로 들어온 정보"만 전달합니다.
@@ -107,10 +136,33 @@ def create_app() -> FastAPI:
             snap = None
         if snap is not None and getattr(snap, "values", None):
             merged = {**dict(snap.values), **incoming}
+
+        logger.info(
+            "FASTAPI merged_state=%s",
+            json.dumps(
+                merged,
+                ensure_ascii=False,
+                default=_to_jsonable,
+            ),
+        )
         result = await chat_app.ainvoke(merged, config=config)
 
         data = result.get("data", {}) or {}
         ai_response = result.get("ai_response")
+
+        logger.info(
+            "RESULT /ai/chat result=%s",
+            json.dumps(
+                {
+                    "step": result.get("step"),
+                    "is_completed": result.get("is_completed"),
+                    "data": result.get("data"),
+                    "ai_response": result.get("ai_response"),
+                },
+                ensure_ascii=False,
+                default=_to_jsonable,
+            ),
+        )
 
         # CHAT_0~CHAT_5: 추천(CHAT_6) 전까지는 보통 data가 비어 있음.
         # 프론트가 "저장 완료" 여부를 쉽게 판단할 수 있도록 메시지를 채워줍니다.
