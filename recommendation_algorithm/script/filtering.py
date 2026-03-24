@@ -7,6 +7,7 @@ DB 테이블:
   - product              : 제품 기본 정보
   - electronics_derived  : 가전 파생컬럼
   - furniture_derived    : 가구 파생컬럼
+  - subscribe_price      : 구독 가격 정보
   - category_stats       : 카테고리별 컬럼 중앙값 (null 처리용)
   - category_price_stats : 카테고리별 대표 가격 (예산 필터링용)
 """
@@ -22,7 +23,7 @@ from sqlalchemy import text
 def fetch_electronics(engine, needed_categories: list) -> pd.DataFrame:
     """
     품목 필터로 가전 제품 + 파생컬럼 조회
-    product 테이블과 electronics_derived 테이블 JOIN
+    product 테이블과 electronics_derived, subscribe_price 테이블 JOIN
     """
     placeholders = ", ".join([f":cat{i}" for i in range(len(needed_categories))])
     params = {f"cat{i}": cat for i, cat in enumerate(needed_categories)}
@@ -42,6 +43,11 @@ def fetch_electronics(engine, needed_categories: list) -> pd.DataFrame:
             p.review_cnt,
             p.product_url,
             p.product_image_url,
+            s.price                 AS subscription_price,
+            s.contract_period_year,
+            s.mandatory_period_year,
+            s.visit_service_type,
+            s.visit_cycle_month,
             e.discount_rate,
             e.value_score,
             e.popularity_score,
@@ -59,6 +65,7 @@ def fetch_electronics(engine, needed_categories: list) -> pd.DataFrame:
             e.energy_grade
         FROM product p
         JOIN electronics_derived e ON p.product_id = e.product_id
+        LEFT JOIN subscribe_price s ON p.product_id = s.product_id
         WHERE p.product_category IN ({placeholders})
           AND p.category = 'APPLIANCE'
           AND p.discount_price IS NOT NULL
