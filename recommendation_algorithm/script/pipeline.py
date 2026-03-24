@@ -169,7 +169,7 @@ if __name__ == "__main__":
         "products": {
             "electronics": {
                 "owned":  ["청소기"],
-                "needed": ["광파오븐/전자레인지", "공기청정기", "세탁기"],
+                "needed": ["전자레인지", "공기청정기", "세탁기"],
             },
             "furniture": {
                 "needed": ["책상", "의자"],
