@@ -206,17 +206,32 @@ def generate_packages(results: dict, budget: int) -> list:
         if len(candidates.get(cat, [])) <= 1:
             single_cat_indices.add(cat_i)
 
+    # ── 가전/가구 그룹 인덱스 분리 (그룹별 다양성 강제용) ────────
+    elec_cat_indices = [ci for ci, cat in enumerate(categories)
+                        if cat in ELECTRONICS_CATEGORIES and ci not in single_cat_indices]
+    furn_cat_indices = [ci for ci, cat in enumerate(categories)
+                        if cat not in ELECTRONICS_CATEGORIES and ci not in single_cat_indices]
+
+    # 그룹별 최소 차이 수: 그룹 내 카테고리가 2개 이상이면 최소 1개 차이 요구
+    min_elec_diff = max(1, int(len(elec_cat_indices) * adaptive_diff_ratio)) if len(elec_cat_indices) >= 2 else 0
+    min_furn_diff = max(1, int(len(furn_cat_indices) * adaptive_diff_ratio)) if len(furn_cat_indices) >= 2 else 0
+
     # ── 전체 정렬 ────────────────────────────────────────────────
     sorted_indices = np.argsort(package_scores)[::-1]
 
-    # ── 스트리밍 다양성 필터 (numpy 인덱스로 빠른 체크) ──────────
+    # ── 스트리밍 다양성 필터 (가전/가구 그룹별 체크) ──────────────
     selected       = []
     used_pids      = {}
     cat_pid_counts = {}  # (cat_i, pid) -> count
-    selected_pid_sets = []  # 선택된 패키지별 pid set (차이 비율 계산용)
+    # 선택된 패키지별 가전/가구 pid set (그룹별 차이 비율 계산용)
+    selected_elec_sets = []
+    selected_furn_sets = []
 
     # 카테고리 수에 따라 최소 차이 제품 수 계산
     min_diff_count = max(1, int(n_categories * adaptive_diff_ratio))
+
+    def _extract_group_pids(flat_idx, group_indices):
+        return set(int(cat_pid_arrays[ci][flat_idx]) for ci in group_indices)
 
     for scan_i in range(total_combos):
         if len(selected) >= N_PACKAGES:
@@ -236,18 +251,17 @@ def generate_packages(results: dict, budget: int) -> list:
         if skip:
             continue
 
-        # 현재 조합의 pid set 구성
-        current_pids = tuple(
-            int(cat_pid_arrays[cat_i][flat_idx]) for cat_i in range(n_categories)
-        )
-        current_pid_set = set(current_pids)
+        # 현재 조합의 가전/가구 pid set 구성
+        cur_elec = _extract_group_pids(flat_idx, elec_cat_indices)
+        cur_furn = _extract_group_pids(flat_idx, furn_cat_indices)
 
-        # 다양성 체크 2: 기존 선택 패키지와 최소 차이 비율 검증
+        # 다양성 체크 2: 가전/가구 각 그룹별 최소 차이 검증
         too_similar = False
-        for prev_pid_set in selected_pid_sets:
-            overlap = len(current_pid_set & prev_pid_set)
-            diff_count = n_categories - overlap
-            if diff_count < min_diff_count:
+        for prev_i in range(len(selected)):
+            elec_diff = len(cur_elec - selected_elec_sets[prev_i])
+            furn_diff = len(cur_furn - selected_furn_sets[prev_i])
+
+            if elec_diff < min_elec_diff or furn_diff < min_furn_diff:
                 too_similar = True
                 break
         if too_similar:
@@ -271,7 +285,8 @@ def generate_packages(results: dict, budget: int) -> list:
         })
 
         # 등장 횟수 업데이트
-        selected_pid_sets.append(current_pid_set)
+        selected_elec_sets.append(cur_elec)
+        selected_furn_sets.append(cur_furn)
         for cat_i in range(n_categories):
             pid = int(cat_pid_arrays[cat_i][flat_idx])
             cat_pid_counts[(cat_i, pid)] = cat_pid_counts.get((cat_i, pid), 0) + 1
@@ -280,23 +295,21 @@ def generate_packages(results: dict, budget: int) -> list:
 
     # 패키지 수가 부족하면 다양성 제약을 단계적으로 완화해서 재시도
     if len(selected) < N_PACKAGES:
-        relaxed_diff = max(1, min_diff_count - 1)
+        relaxed_elec = max(1, min_elec_diff - 1) if min_elec_diff > 1 else 0
+        relaxed_furn = max(1, min_furn_diff - 1) if min_furn_diff > 1 else 0
         for scan_i in range(total_combos):
             if len(selected) >= N_PACKAGES:
                 break
             flat_idx = int(sorted_indices[scan_i])
 
-            current_pids = tuple(
-                int(cat_pid_arrays[cat_i][flat_idx]) for cat_i in range(n_categories)
-            )
-            current_pid_set = set(current_pids)
+            cur_elec = _extract_group_pids(flat_idx, elec_cat_indices)
+            cur_furn = _extract_group_pids(flat_idx, furn_cat_indices)
 
-            # 이미 선택된 조합과 동일한지만 체크 (완화된 기준)
             too_similar = False
-            for prev_pid_set in selected_pid_sets:
-                overlap = len(current_pid_set & prev_pid_set)
-                diff_count = n_categories - overlap
-                if diff_count < relaxed_diff:
+            for prev_i in range(len(selected)):
+                elec_diff = len(cur_elec - selected_elec_sets[prev_i])
+                furn_diff = len(cur_furn - selected_furn_sets[prev_i])
+                if elec_diff < relaxed_elec or furn_diff < relaxed_furn:
                     too_similar = True
                     break
             if too_similar:
@@ -315,7 +328,8 @@ def generate_packages(results: dict, budget: int) -> list:
                 "total_price":   total_price,
                 "adjusted_score": pkg_score - penalty,
             })
-            selected_pid_sets.append(current_pid_set)
+            selected_elec_sets.append(cur_elec)
+            selected_furn_sets.append(cur_furn)
             for pid in pids:
                 used_pids[pid] = used_pids.get(pid, 0) + 1
 
@@ -493,6 +507,24 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
     else:
         theme_diff_ratio = 0.2
 
+    def _split_group_keys(pkg):
+        """패키지의 제품을 가전/가구 그룹별 key set으로 분리"""
+        products = pkg.get("products") or []
+        elec_keys = set()
+        furn_keys = set()
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            k = _product_identity_key(p)
+            if not k:
+                continue
+            cat = p.get("category", "")
+            if cat in ELECTRONICS_CATEGORIES:
+                elec_keys.add(k)
+            else:
+                furn_keys.add(k)
+        return elec_keys, furn_keys
+
     for theme in themes:
         scored = sorted(
             [
@@ -505,22 +537,23 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
 
         picked_in_theme = 0
         picked_indices  = []
-        theme_pid_sets  = []  # 테마 내 다양성 검증용
+        theme_elec_sets = []  # 테마 내 가전 다양성 검증용
+        theme_furn_sets = []  # 테마 내 가구 다양성 검증용
 
-        # 1차: 적응형 다양성 기준으로 선택
+        # 1차: 가전/가구 각 그룹별 다양성 기준으로 선택
         for i, _ in scored:
             if picked_in_theme >= N_PER_THEME:
                 break
 
-            cur_keys = _package_product_keys(all_packages[i])
-            n_products = len(all_packages[i].get("products", []))
-            min_diff = max(1, int(n_products * theme_diff_ratio))
+            cur_elec, cur_furn = _split_group_keys(all_packages[i])
+            min_elec = max(1, int(len(cur_elec) * theme_diff_ratio)) if len(cur_elec) >= 2 else 0
+            min_furn = max(1, int(len(cur_furn) * theme_diff_ratio)) if len(cur_furn) >= 2 else 0
 
             too_similar = False
-            for prev_keys in theme_pid_sets:
-                overlap = len(cur_keys & prev_keys)
-                diff_count = n_products - overlap
-                if diff_count < min_diff:
+            for prev_i in range(len(theme_elec_sets)):
+                elec_diff = len(cur_elec - theme_elec_sets[prev_i])
+                furn_diff = len(cur_furn - theme_furn_sets[prev_i])
+                if elec_diff < min_elec or furn_diff < min_furn:
                     too_similar = True
                     break
             if too_similar:
@@ -528,10 +561,11 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
 
             selected.append({"theme": theme, "package": all_packages[i]})
             picked_indices.append(i)
-            theme_pid_sets.append(cur_keys)
+            theme_elec_sets.append(cur_elec)
+            theme_furn_sets.append(cur_furn)
             picked_in_theme += 1
 
-        # 2차: 부족하면 다양성 기준 완화 (최소 1개 차이만 요구)
+        # 2차: 부족하면 가전/가구 각각 최소 1개 차이로 완화
         if picked_in_theme < N_PER_THEME:
             for i, _ in scored:
                 if picked_in_theme >= N_PER_THEME:
@@ -539,13 +573,15 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
                 if i in picked_indices:
                     continue
 
-                cur_keys = _package_product_keys(all_packages[i])
-                n_products = len(all_packages[i].get("products", []))
+                cur_elec, cur_furn = _split_group_keys(all_packages[i])
+                relaxed_elec = 1 if len(cur_elec) >= 2 else 0
+                relaxed_furn = 1 if len(cur_furn) >= 2 else 0
 
                 too_similar = False
-                for prev_keys in theme_pid_sets:
-                    overlap = len(cur_keys & prev_keys)
-                    if n_products - overlap < 1:
+                for prev_i in range(len(theme_elec_sets)):
+                    elec_diff = len(cur_elec - theme_elec_sets[prev_i])
+                    furn_diff = len(cur_furn - theme_furn_sets[prev_i])
+                    if elec_diff < relaxed_elec or furn_diff < relaxed_furn:
                         too_similar = True
                         break
                 if too_similar:
@@ -553,7 +589,8 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
 
                 selected.append({"theme": theme, "package": all_packages[i]})
                 picked_indices.append(i)
-                theme_pid_sets.append(cur_keys)
+                theme_elec_sets.append(cur_elec)
+                theme_furn_sets.append(cur_furn)
                 picked_in_theme += 1
 
         # 선택된 조합을 풀에서 제거
