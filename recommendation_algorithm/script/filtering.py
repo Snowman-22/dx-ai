@@ -65,7 +65,13 @@ def fetch_electronics(engine, needed_categories: list) -> pd.DataFrame:
             e.energy_grade
         FROM product p
         JOIN electronics_derived e ON p.product_id = e.product_id
-        LEFT JOIN subscribe_price s ON p.product_id = s.product_id
+        LEFT JOIN (
+            SELECT DISTINCT ON (product_id)
+                product_id, price, contract_period_year,
+                mandatory_period_year, visit_service_type, visit_cycle_month
+            FROM subscribe_price
+            ORDER BY product_id, price ASC
+        ) s ON p.product_id = s.product_id
         WHERE p.product_category IN ({placeholders})
           AND p.category = 'APPLIANCE'
           AND p.discount_price IS NOT NULL

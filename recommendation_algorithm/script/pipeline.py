@@ -164,12 +164,12 @@ def run_full_pipeline(input_data: dict, engine, use_llm: bool = True) -> dict:
 if __name__ == "__main__":
     input_data = {
         "starter_package": "혼자 사는 라이프",
-        "budget": 3_000_000,
+        "budget": 5_000_000,
         "square_footage": 15,
         "products": {
             "electronics": {
-                "owned":  ["냉장고", "세탁기", "청소기"],
-                "needed": ["광파오븐/전자레인지", "공기청정기"],
+                "owned":  ["청소기"],
+                "needed": ["광파오븐/전자레인지", "공기청정기", "세탁기"],
             },
             "furniture": {
                 "needed": ["책상", "의자"],
@@ -189,3 +189,36 @@ if __name__ == "__main__":
         output = run_full_pipeline(input_data, engine, use_llm=True)
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
+
+    from scoring import rerank, generate_packages, select_themed_packages, _determine_themes, _score_by_theme, _package_product_keys, _product_identity_key
+
+    with get_engine() as engine:
+        results = run_pipeline(input_data, engine)
+        reranked = rerank(results)
+        all_packages = generate_packages(reranked, input_data["budget"])
+        themes = _determine_themes(input_data["preferences"])
+        print("결정된 테마:", themes)
+        print(f"전체 조합 수: {len(all_packages)}")
+
+        # 테마별 상위 5개 조합 점수 확인
+        for theme in themes:
+            print(f"\n[{theme}] 상위 5개 조합:")
+            scored = sorted(
+                [(i, _score_by_theme(pkg, theme, input_data["budget"]))
+                for i, pkg in enumerate(all_packages)],
+                key=lambda x: x[1], reverse=True
+            )[:5]
+            for i, score in scored:
+                pids = [p.get("product_id") for p in all_packages[i]["products"]]
+                print(f"  idx={i}, score={score:.4f}, ids={pids}")
+    
+    print("\n[all_packages 상위 5개 조합 product_ids]")
+    for i, pkg in enumerate(all_packages[:5]):
+        pids = [p.get("product_id") for p in pkg["products"]]
+        print(f"  idx={i}: {pids}")
+    
+    from scoring import _get_candidates
+    candidates = _get_candidates(reranked)
+    for cat, prods in candidates.items():
+        pids = [p.get("product_id") for p in prods]
+        print(f"  [{cat}] 후보 {len(prods)}개: {pids}")

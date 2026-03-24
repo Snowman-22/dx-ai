@@ -25,7 +25,7 @@ N_PER_THEME         = 4    # 테마별 패키지 수
 N_DISPLAY           = N_THEMES  # _determine_themes용
 MIN_PACKAGES        = 3    # 최종 최소 패키지 수
 MIN_PRODUCTS_PER_PACKAGE = 3  # 패키지당 최소 상품 수
-DIVERSITY_PENALTY   = 0.15  # 이미 등장한 제품 1개당 패널티
+DIVERSITY_PENALTY   = 0.5   # 이미 등장한 제품 1개당 패널티 (강하게 적용)
 
 
 # ================================================================== #
@@ -111,9 +111,13 @@ def _calc_package_score(products: list, budget: int) -> float:
 def generate_packages(results: dict, budget: int) -> list:
     """
     카테고리별 상위 5개 후보로 모든 조합 탐색
-    다양성 보장: 이미 선택된 제품이 포함된 조합에 패널티 부여
+    - 카테고리별 제품 등장 횟수 제한 (MAX_PRODUCT_APPEARANCES)
+      → 60개 풀 안에 다양한 제품 조합 보장
+    - 다양성 패널티 추가 적용
     → N_PACKAGES개 반환
     """
+    MAX_PRODUCT_APPEARANCES = 4  # 카테고리별 제품당 최대 등장 횟수
+
     candidates = _get_candidates(results)
     if not candidates:
         return []
@@ -136,20 +140,44 @@ def generate_packages(results: dict, budget: int) -> list:
     # PackageScore 내림차순 정렬
     all_combos.sort(key=lambda x: x["package_score"], reverse=True)
 
-    # 다양성 보장: 이미 선택된 product_id에 패널티 적용하며 순차 선택
-    selected  = []
-    used_pids = {}  # {product_id: 등장 횟수}
+    # 카테고리별 제품 등장 횟수 제한 + 다양성 패널티 적용
+    selected        = []
+    used_pids       = {}  # {product_id: 등장 횟수}
+    cat_pid_counts  = {}  # {(category, product_id): 등장 횟수}
 
     for combo in all_combos:
         if len(selected) >= N_PACKAGES:
             break
 
-        pids    = [p.get("product_id") for p in combo["products"]]
-        penalty = sum(used_pids.get(pid, 0) * DIVERSITY_PENALTY for pid in pids)
+        products = combo["products"]
+
+        # 카테고리별 제품 등장 횟수 초과 여부 확인
+        skip = False
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            cat = p.get("category", "")
+            pid = p.get("product_id")
+            if cat_pid_counts.get((cat, pid), 0) >= MAX_PRODUCT_APPEARANCES:
+                skip = True
+                break
+        if skip:
+            continue
+
+        # 다양성 패널티 계산
+        pids           = [p.get("product_id") for p in products]
+        penalty        = sum(used_pids.get(pid, 0) * DIVERSITY_PENALTY for pid in pids)
         adjusted_score = combo["package_score"] - penalty
 
         selected.append({**combo, "adjusted_score": adjusted_score})
 
+        # 등장 횟수 업데이트
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            cat = p.get("category", "")
+            pid = p.get("product_id")
+            cat_pid_counts[(cat, pid)] = cat_pid_counts.get((cat, pid), 0) + 1
         for pid in pids:
             used_pids[pid] = used_pids.get(pid, 0) + 1
 
@@ -308,40 +336,40 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
 def select_themed_packages(all_packages: list, preferences: list, budget: int) -> list:
     """
     전체 조합 풀에서 테마별로 상위 N_PER_THEME개씩 선별
-    중복 패키지 방지 + 상품당 최대 2회 등장 제한
-    반환: [{"theme": str, "package": dict}, ...]  총 N_THEMES × N_PER_THEME개
+    - 테마별 순차 탐색: 이전 테마에서 선택된 조합은 다음 테마 풀에서 제거
+    - 공간 최적화: 60개 → 4개 선택 → 56개 남음
+    - 효율:        56개 → 4개 선택 → 52개 남음
+    - 펫 프렌들리: 52개 → 4개 선택
+    반환: [{"theme": str, "package": dict}, ...]
     """
-    themes             = _determine_themes(preferences)
-    selected           = []
-    used_idx           = set()
-    product_key_counts = {}
+    themes    = _determine_themes(preferences)
+    selected  = []
+    remaining = list(range(len(all_packages)))  # 아직 선택 안 된 조합 인덱스
 
     for theme in themes:
+        # 남은 풀에서 테마 점수 계산
         scored = sorted(
             [
-                (i, _score_by_theme(pkg, theme, budget))
-                for i, pkg in enumerate(all_packages)
-                if i not in used_idx
+                (i, _score_by_theme(all_packages[i], theme, budget))
+                for i in remaining
             ],
             key=lambda x: x[1],
             reverse=True,
         )
+
         picked_in_theme = 0
+        picked_indices  = []
+
         for i, _ in scored:
             if picked_in_theme >= N_PER_THEME:
                 break
-            candidate_pkg  = all_packages[i]
-            candidate_keys = _package_product_keys(candidate_pkg)
-
-            # 상품당 최대 2회까지만 허용
-            if any(product_key_counts.get(k, 0) >= 2 for k in candidate_keys):
-                continue
-
-            used_idx.add(i)
-            for k in candidate_keys:
-                product_key_counts[k] = product_key_counts.get(k, 0) + 1
-            selected.append({"theme": theme, "package": candidate_pkg})
+            selected.append({"theme": theme, "package": all_packages[i]})
+            picked_indices.append(i)
             picked_in_theme += 1
+
+        # 선택된 조합을 풀에서 제거
+        for i in picked_indices:
+            remaining.remove(i)
 
     return selected
 
