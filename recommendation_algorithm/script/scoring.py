@@ -18,7 +18,7 @@ from typing import Optional
 
 # ── 설정 ────────────────────────────────────────────────────────────
 
-TOP_N_PER_CATEGORY = 5    # 카테고리별 상위 N개 후보
+TOP_N_PER_CATEGORY  = 5    # 카테고리별 상위 N개 후보
 N_PACKAGES          = 60   # 전체 조합 풀 크기
 N_THEMES            = 3    # 테마 수
 N_PER_THEME         = 4    # 테마별 패키지 수
@@ -97,7 +97,9 @@ def _calc_package_score(products: list, budget: int) -> float:
     budget_fit   = 1 - abs(총조합가격 - 총예산) / 총예산
     """
     score_col  = "final_score" if "final_score" in products[0] else "derived_score"
-    avg_score  = np.mean([p.get(score_col, 0.0) for p in products])
+    n = len(products)
+    score_sum = sum(p.get(score_col, 0.0) for p in products)
+    avg_score = score_sum / n if n > 0 else 0.0
 
     total_price = sum(p.get("price", 0) for p in products)
     if budget > 0:
@@ -110,13 +112,13 @@ def _calc_package_score(products: list, budget: int) -> float:
 
 def generate_packages(results: dict, budget: int) -> list:
     """
-    카테고리별 상위 5개 후보로 모든 조합 탐색
-    - 카테고리별 제품 등장 횟수 제한 (MAX_PRODUCT_APPEARANCES)
-      → 60개 풀 안에 다양한 제품 조합 보장
-    - 다양성 패널티 추가 적용
-    → N_PACKAGES개 반환
+    numpy 벡터화 전수탐색으로 조합 생성
+    - 모든 조합의 점수/가격을 numpy 배열로 한번에 계산
+    - 복잡도: O(total_combos) but 벡터 연산으로 빠름
+    - 5^11 = ~48M 이상이면 TOP_N을 자동으로 줄여서 제한
     """
-    MAX_PRODUCT_APPEARANCES = 4  # 카테고리별 제품당 최대 등장 횟수
+    MAX_COMBOS = 2_000_000   # numpy 벡터 연산 가능한 한계
+    MAX_PRODUCT_APPEARANCES = 4
 
     candidates = _get_candidates(results)
     if not candidates:
@@ -124,60 +126,122 @@ def generate_packages(results: dict, budget: int) -> list:
 
     categories      = list(candidates.keys())
     candidate_lists = [candidates[cat] for cat in categories]
+    n_categories    = len(candidate_lists)
 
-    # 모든 조합 탐색
-    all_combos = []
-    for combo in itertools.product(*candidate_lists):
-        products      = list(combo)
-        package_score = _calc_package_score(products, budget)
-        total_price   = sum(p.get("price", 0) for p in products)
-        all_combos.append({
-            "products":      products,
-            "package_score": package_score,
-            "total_price":   total_price,
-        })
+    # 총 조합 수 계산, 너무 많으면 카테고리당 후보 수를 줄임
+    def _calc_total(clists):
+        t = 1
+        for cl in clists:
+            t *= max(len(cl), 1)
+        return t
 
-    # PackageScore 내림차순 정렬
-    all_combos.sort(key=lambda x: x["package_score"], reverse=True)
+    effective_lists = [list(cl) for cl in candidate_lists]
+    while _calc_total(effective_lists) > MAX_COMBOS:
+        # 가장 후보가 많은 카테고리에서 1개씩 줄임
+        max_len = max(len(cl) for cl in effective_lists)
+        for cl in effective_lists:
+            if len(cl) == max_len:
+                cl.pop()
+                break
+        if all(len(cl) <= 1 for cl in effective_lists):
+            break
 
-    # 카테고리별 제품 등장 횟수 제한 + 다양성 패널티 적용
+    total_combos = _calc_total(effective_lists)
+
+    # score_col 결정
+    first_product = effective_lists[0][0] if effective_lists[0] else {}
+    score_col = "final_score" if "final_score" in first_product else "derived_score"
+
+    # ── 카테고리별 점수/가격 배열 준비 ───────────────────────────
+    cat_scores = []  # [np.array for each category]
+    cat_prices = []
+    for cl in effective_lists:
+        cat_scores.append(np.array([p.get(score_col, 0.0) for p in cl]))
+        cat_prices.append(np.array([p.get("price", 0) for p in cl]))
+
+    # ── numpy meshgrid로 모든 조합의 인덱스 생성 ────────────────
+    ranges = [np.arange(len(cl)) for cl in effective_lists]
+    grids  = np.meshgrid(*ranges, indexing="ij")
+    # 각 grid를 flatten → (total_combos,) 배열
+    idx_arrays = [g.ravel() for g in grids]
+
+    # ── 벡터화 점수/가격 계산 ────────────────────────────────────
+    score_sum = np.zeros(total_combos)
+    price_sum = np.zeros(total_combos, dtype=np.int64)
+
+    for cat_i in range(n_categories):
+        score_sum += cat_scores[cat_i][idx_arrays[cat_i]]
+        price_sum += cat_prices[cat_i][idx_arrays[cat_i]]
+
+    avg_scores = score_sum / n_categories
+
+    if budget > 0:
+        budget_fits = np.maximum(0.0, 1.0 - np.abs(price_sum - budget) / budget)
+    else:
+        budget_fits = np.ones(total_combos)
+
+    package_scores = 0.8 * avg_scores + 0.2 * budget_fits
+
+    # ── PID 인덱스 매핑 (numpy 레벨에서 빠른 다양성 체크) ────────
+    # cat_pid_arrays[cat_i] = idx_arrays[cat_i]에 대응하는 product_id 배열
+    cat_pid_arrays = []
+    for cat_i in range(n_categories):
+        pids_for_cat = np.array([p.get("product_id", 0) for p in effective_lists[cat_i]])
+        cat_pid_arrays.append(pids_for_cat[idx_arrays[cat_i]])  # (total_combos,)
+
+    # 후보가 1개뿐인 카테고리 인덱스
+    single_cat_indices = set()
+    for cat_i, cat in enumerate(categories):
+        if len(candidates.get(cat, [])) <= 1:
+            single_cat_indices.add(cat_i)
+
+    # ── 전체 정렬 ────────────────────────────────────────────────
+    sorted_indices = np.argsort(package_scores)[::-1]
+
+    # ── 스트리밍 다양성 필터 (numpy 인덱스로 빠른 체크) ──────────
     selected       = []
-    used_pids      = {}  # {product_id: 등장 횟수}
-    cat_pid_counts = {}  # {(category, product_id): 등장 횟수}
+    used_pids      = {}
+    cat_pid_counts = {}  # (cat_i, pid) -> count
 
-    for combo in all_combos:
+    for scan_i in range(total_combos):
         if len(selected) >= N_PACKAGES:
             break
 
-        products = combo["products"]
+        flat_idx = int(sorted_indices[scan_i])
 
-        # 카테고리별 제품 등장 횟수 초과 여부 확인
+        # 다양성 체크 (dict 생성 없이 numpy 배열로 직접 체크)
         skip = False
-        for p in products:
-            if not isinstance(p, dict):
+        for cat_i in range(n_categories):
+            if cat_i in single_cat_indices:
                 continue
-            cat = p.get("category", "")
-            pid = p.get("product_id")
-            if cat_pid_counts.get((cat, pid), 0) >= MAX_PRODUCT_APPEARANCES:
+            pid = int(cat_pid_arrays[cat_i][flat_idx])
+            if cat_pid_counts.get((cat_i, pid), 0) >= MAX_PRODUCT_APPEARANCES:
                 skip = True
                 break
         if skip:
             continue
 
-        # 다양성 패널티 계산
-        pids           = [p.get("product_id") for p in products]
-        penalty        = sum(used_pids.get(pid, 0) * DIVERSITY_PENALTY for pid in pids)
-        adjusted_score = combo["package_score"] - penalty
+        # 통과한 조합만 dict 생성
+        products = [effective_lists[cat_i][idx_arrays[cat_i][flat_idx]]
+                    for cat_i in range(n_categories)]
 
-        selected.append({**combo, "adjusted_score": adjusted_score})
+        pkg_score   = float(package_scores[flat_idx])
+        total_price = int(price_sum[flat_idx])
+
+        pids    = [p.get("product_id") for p in products]
+        penalty = sum(used_pids.get(pid, 0) * DIVERSITY_PENALTY for pid in pids)
+
+        selected.append({
+            "products":      products,
+            "package_score": pkg_score,
+            "total_price":   total_price,
+            "adjusted_score": pkg_score - penalty,
+        })
 
         # 등장 횟수 업데이트
-        for p in products:
-            if not isinstance(p, dict):
-                continue
-            cat = p.get("category", "")
-            pid = p.get("product_id")
-            cat_pid_counts[(cat, pid)] = cat_pid_counts.get((cat, pid), 0) + 1
+        for cat_i in range(n_categories):
+            pid = int(cat_pid_arrays[cat_i][flat_idx])
+            cat_pid_counts[(cat_i, pid)] = cat_pid_counts.get((cat_i, pid), 0) + 1
         for pid in pids:
             used_pids[pid] = used_pids.get(pid, 0) + 1
 

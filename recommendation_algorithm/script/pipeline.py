@@ -11,6 +11,7 @@ pipeline.py
     6. 추천 이유 생성 → recommendation_reason.py
 """
 
+import time
 from typing import Optional
 
 from db import get_engine
@@ -33,6 +34,7 @@ from image_score import (
 from review_score import (
     calc_review_scores,
     calc_final_score_electronics,
+    preload_models,
 )
 from scoring import run_scoring
 
@@ -64,6 +66,7 @@ def run_pipeline(input_data: dict, engine) -> dict:
     반환: { 카테고리명: df }  예) { "냉장고": df, "세탁기": df, "침대": df, ... }
     각 df는 해당 카테고리 후보 제품들을 derived_score 내림차순으로 정렬
     """
+    t_total = time.time()
     p = parse_input(input_data)
 
     # ── 공통 데이터 로드 ──────────────────────────────────────────
@@ -72,17 +75,21 @@ def run_pipeline(input_data: dict, engine) -> dict:
 
     all_needed = p["needed_electronics"] + p["needed_furniture"]
     allocated  = allocate_budget(all_needed, p["budget"], category_price_stats)
+    print(f"  [pipeline] 공통 데이터 로드: {time.time()-t_total:.3f}s")
 
     results = {}
 
     # ── 가전 ─────────────────────────────────────────────────────
     if p["needed_electronics"]:
+        t0 = time.time()
         df_e = fetch_electronics(engine, p["needed_electronics"])
         df_e = filter_by_budget(df_e, allocated)
+        print(f"  [pipeline] 가전 DB조회+필터: {time.time()-t0:.3f}s ({len(df_e)}건)")
         # 후보 없음 / 스키마 이상 → 가전만 건너뛰고 가구·스코어링은 계속
         if df_e.empty or "category" not in df_e.columns:
             pass
         else:
+            t0 = time.time()
             df_e["derived_score"] = df_e.apply(
                 lambda row: calc_electronics_derived_score(
                     row,
@@ -94,12 +101,15 @@ def run_pipeline(input_data: dict, engine) -> dict:
                 ),
                 axis=1,
             )
+            print(f"  [pipeline] 가전 derived_score: {time.time()-t0:.3f}s")
 
             if df_e.empty or "category" not in df_e.columns:
                 pass
             else:
                 # ReviewScore 계산
+                t0 = time.time()
                 df_e = calc_review_scores(df_e, p["starter"], p["preferences"], engine)
+                print(f"  [pipeline] 가전 review_score: {time.time()-t0:.3f}s")
 
                 # FinalScore = 0.7 * derived_score + 0.3 * review_score
                 df_e = calc_final_score_electronics(df_e)
@@ -110,13 +120,16 @@ def run_pipeline(input_data: dict, engine) -> dict:
 
     # ── 가구 ─────────────────────────────────────────────────────
     if p["needed_furniture"]:
+        t0 = time.time()
         df_f = fetch_furniture(engine, p["needed_furniture"])
         df_f = filter_by_budget(df_f, allocated)
+        print(f"  [pipeline] 가구 DB조회+필터: {time.time()-t0:.3f}s ({len(df_f)}건)")
 
         # 후보 없음 / 스키마 이상 → 가구만 건너뛰고 가전·스코어링은 계속
         if df_f.empty or "category" not in df_f.columns:
             pass
         else:
+            t0 = time.time()
             df_f["derived_score"] = df_f.apply(
                 lambda row: calc_furniture_derived_score(
                     row,
@@ -127,12 +140,15 @@ def run_pipeline(input_data: dict, engine) -> dict:
                 ),
                 axis=1,
             )
+            print(f"  [pipeline] 가구 derived_score: {time.time()-t0:.3f}s")
 
             if df_f.empty or "category" not in df_f.columns:
                 pass
             else:
                 # ImageScore 계산
+                t0 = time.time()
                 df_f = calc_image_scores(df_f, p["style"], engine)
+                print(f"  [pipeline] 가구 image_score: {time.time()-t0:.3f}s")
 
                 # FinalScore = 0.6 * derived_score + 0.4 * image_score
                 df_f = calc_final_score_furniture(df_f)
@@ -141,13 +157,15 @@ def run_pipeline(input_data: dict, engine) -> dict:
                 for cat, df_cat in df_f.groupby("category"):
                     results[cat] = df_cat.sort_values("final_score", ascending=False).reset_index(drop=True)
 
+    print(f"  [pipeline] 전체 run_pipeline: {time.time()-t_total:.3f}s")
     return results
 
 
 def run_full_pipeline(input_data: dict, engine, use_llm: bool = True) -> dict:
+    t_full = time.time()
     p       = parse_input(input_data)
     results = run_pipeline(input_data, engine)
-    return run_scoring(
+    output = run_scoring(
         results,
         budget         = p["budget"],
         starter        = p["starter"],
@@ -155,6 +173,8 @@ def run_full_pipeline(input_data: dict, engine, use_llm: bool = True) -> dict:
         square_footage = p["square_footage"] or 0,
         use_llm        = use_llm,
     )
+    print(f"  [pipeline] 전체 run_full_pipeline: {time.time()-t_full:.3f}s")
+    return output
 
 
 # ================================================================== #
