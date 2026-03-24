@@ -188,13 +188,10 @@ def allocate_budget(needed_items: list, budget: int, category_price_stats: dict)
 def filter_by_budget(df: pd.DataFrame, allocated_budget: dict, price_col: str = "price") -> pd.DataFrame:
     """
     각 제품의 카테고리별 배정 예산의 110% 이하인 제품만 남김
+    (벡터화 버전 - df.apply 제거)
     """
-    def is_within_budget(row):
-        cat = row.get("category")
-        budget_for_cat = allocated_budget.get(cat)
-        if budget_for_cat is None:
-            return True
-        return row[price_col] <= budget_for_cat * 1.1
-
-    mask = df.apply(is_within_budget, axis=1)
+    if df.empty:
+        return df.copy()
+    budget_series = df["category"].map(allocated_budget)
+    mask = budget_series.isna() | (df[price_col] <= budget_series * 1.1)
     return df[mask].copy()

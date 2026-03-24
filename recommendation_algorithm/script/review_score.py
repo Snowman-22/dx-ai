@@ -72,6 +72,13 @@ _cluster_bundle = None
 _embed_model    = None
 
 
+def preload_models():
+    """서버 시작 시 호출하여 모델을 미리 로딩 (콜드 스타트 방지)"""
+    _load_cluster_bundle()
+    _load_embed_model()
+    print("[review_score] 모델 프리로딩 완료")
+
+
 def _load_cluster_bundle() -> dict:
     global _cluster_bundle
     if _cluster_bundle is None:
