@@ -25,7 +25,7 @@ N_PER_THEME         = 4    # 테마별 패키지 수
 N_DISPLAY           = N_THEMES  # _determine_themes용
 MIN_PACKAGES        = 3    # 최종 최소 패키지 수
 MIN_PRODUCTS_PER_PACKAGE = 3  # 패키지당 최소 상품 수
-DIVERSITY_PENALTY   = 0.5   # 이미 등장한 제품 1개당 패널티 (강하게 적용)
+DIVERSITY_PENALTY   = 0.5   # 이미 등장한 제품 1개당 패널티
 
 
 # ================================================================== #
@@ -141,9 +141,9 @@ def generate_packages(results: dict, budget: int) -> list:
     all_combos.sort(key=lambda x: x["package_score"], reverse=True)
 
     # 카테고리별 제품 등장 횟수 제한 + 다양성 패널티 적용
-    selected        = []
-    used_pids       = {}  # {product_id: 등장 횟수}
-    cat_pid_counts  = {}  # {(category, product_id): 등장 횟수}
+    selected       = []
+    used_pids      = {}  # {product_id: 등장 횟수}
+    cat_pid_counts = {}  # {(category, product_id): 등장 횟수}
 
     for combo in all_combos:
         if len(selected) >= N_PACKAGES:
@@ -335,8 +335,8 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
 
 def select_themed_packages(all_packages: list, preferences: list, budget: int) -> list:
     """
-    전체 조합 풀에서 테마별로 상위 N_PER_THEME개씩 선별
-    - 테마별 순차 탐색: 이전 테마에서 선택된 조합은 다음 테마 풀에서 제거
+    전체 조합 풀에서 테마별로 상위 N_PER_THEME개씩 순차 선별
+    - 이전 테마에서 선택된 조합은 다음 테마 풀에서 제거
     - 공간 최적화: 60개 → 4개 선택 → 56개 남음
     - 효율:        56개 → 4개 선택 → 52개 남음
     - 펫 프렌들리: 52개 → 4개 선택
@@ -347,7 +347,6 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
     remaining = list(range(len(all_packages)))  # 아직 선택 안 된 조합 인덱스
 
     for theme in themes:
-        # 남은 풀에서 테마 점수 계산
         scored = sorted(
             [
                 (i, _score_by_theme(all_packages[i], theme, budget))
@@ -397,6 +396,9 @@ ELECTRONICS_CATEGORIES = {
 
 def _format_appliance(p: dict) -> dict:
     return {
+        "productId":            p.get("product_id"),
+        "modelId":              p.get("model_id"),
+        "brand":                p.get("brand", ""),
         "name":                 p.get("name", ""),
         "category":             p.get("category", ""),
         "totalPrice":           _safe_int(p.get("original_price") or p.get("price", 0)),
@@ -413,6 +415,9 @@ def _format_appliance(p: dict) -> dict:
 
 def _format_furniture(p: dict) -> dict:
     return {
+        "productId":  p.get("product_id"),
+        "modelId":    p.get("model_id"),
+        "brand":      p.get("brand", ""),
         "name":       p.get("name", ""),
         "category":   p.get("category", ""),
         "price":      int(p.get("price", 0)),
