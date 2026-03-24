@@ -101,6 +101,14 @@ class SubscribePriceEntity(Base):
     visit_cycle_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
+class ProductTagsEntity(Base):
+    """product_tags 테이블: 상품별 리뷰 기반 태그."""
+    __tablename__ = "product_tags"
+
+    product_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tags: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), nullable=True)
+
+
 class Chat(Base):
     """
     진단/추천 세션 메타데이터.

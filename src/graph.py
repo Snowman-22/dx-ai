@@ -11,11 +11,18 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END, START
 
 from .db import get_session_maker
-from .product_details import fetch_products_bundle_details
+from .product_details import (
+    fetch_product_review_tags,
+    fetch_products_bundle_details,
+    fetch_products_comparison,
+    search_products_by_keywords,
+    semantic_search_products,
+)
 from .state_store import get_checkpointer
 from .prompt import (
     build_blueprint_rag_prompt,
     build_rag_prompt,
+    build_rag_prompt_with_db_products,
     build_rag_prompt_with_package_context,
 )
 from .recommend import generate_recommendation_result
@@ -1374,7 +1381,146 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                 prompt = None
 
     if prompt is None:
-        prompt = build_rag_prompt(user_info, question_str)
+        # ── 의도 분류 ──
+        q_str = _to_str(question_str)
+        q_lower = q_str.lower().replace(" ", "")
+
+        want_review = any(k in q_lower for k in (
+            "리뷰", "후기", "평가", "평점", "사용후기", "사용기", "만족도",
+            "별점", "장점", "단점", "review",
+        ))
+        want_compare = any(k in q_lower for k in (
+            "비교", "차이", "뭐가다", "뭐가나", "어떤게나", "어떤게더",
+            "vs", "차이점", "비교해", "비교좀",
+        ))
+        want_semantic = any(k in q_lower for k in (
+            "비슷한", "유사한", "같은류", "이런거", "이런제품", "이런종류",
+            "대안", "대체", "비슷한거", "추천해줘",
+        ))
+
+        # ── 추천 상품 model_id 수집 ──
+        all_recs = new_data.get("recommendation_list") or []
+        rec_model_ids: List[str] = []
+        rec_product_ids: List[int] = []
+        for pkg in (all_recs if isinstance(all_recs, list) else []):
+            if not isinstance(pkg, dict):
+                continue
+            for p in _package_items(pkg):
+                if not isinstance(p, dict):
+                    continue
+                mid = _to_str(p.get("model_id"))
+                if mid and mid not in rec_model_ids:
+                    rec_model_ids.append(mid)
+                pid = p.get("product_id")
+                if pid is not None:
+                    try:
+                        rec_product_ids.append(int(pid))
+                    except (TypeError, ValueError):
+                        pass
+
+        # ── 키워드 추출 ──
+        search_keywords: List[str] = []
+        for canonical, aliases in {**APPLIANCE_KEYWORDS, **FURNITURE_KEYWORDS}.items():
+            for alias in aliases:
+                if alias.lower() in q_str.lower():
+                    search_keywords.append(canonical)
+                    break
+
+        # ── DB 조회 (하나의 세션으로 통합) ──
+        recommended_details: Dict[str, Any] = {"products": []}
+        searched_details: Dict[str, Any] = {"products": []}
+        review_tags_data: Dict[int, List[str]] = {}
+        comparison_data: List[Dict[str, Any]] = []
+        semantic_results: List[Dict[str, Any]] = []
+
+        try:
+            session_maker = get_session_maker()
+            async with session_maker() as session:
+                # 1) 추천 상품 상세
+                if rec_model_ids:
+                    recommended_details = await fetch_products_bundle_details(
+                        session, model_ids=rec_model_ids
+                    )
+
+                # 2) 키워드 검색
+                if search_keywords:
+                    searched_details = await search_products_by_keywords(
+                        session, keywords=search_keywords, limit=10
+                    )
+
+                # 3) 리뷰 태그 조회
+                if want_review:
+                    all_pids = list(set(rec_product_ids))
+                    # searched 결과의 product_id도 추가
+                    for sp in (searched_details.get("products") or []):
+                        sprod = sp.get("product") or {}
+                        spid = sprod.get("product_id")
+                        if spid is not None and spid not in all_pids:
+                            all_pids.append(spid)
+                    if all_pids:
+                        review_tags_data = await fetch_product_review_tags(
+                            session, product_ids=all_pids
+                        )
+
+                # 4) 상품 비교
+                if want_compare and rec_model_ids:
+                    comparison_data = await fetch_products_comparison(
+                        session, model_ids=rec_model_ids
+                    )
+
+                # 5) 시맨틱(벡터) 검색
+                if want_semantic:
+                    try:
+                        from openai import AsyncOpenAI
+                        import os
+                        oai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                        emb_resp = await oai.embeddings.create(
+                            model="text-embedding-3-small",
+                            input=q_str,
+                        )
+                        query_vec = emb_resp.data[0].embedding
+                        semantic_results = await semantic_search_products(
+                            session, query_embedding=query_vec, top_k=5
+                        )
+                    except Exception:
+                        semantic_results = []
+        except Exception:
+            pass
+
+        has_any_data = (
+            recommended_details.get("products")
+            or searched_details.get("products")
+            or review_tags_data
+            or comparison_data
+            or semantic_results
+        )
+
+        if has_any_data:
+            # review_tags_data: {pid: [tags]} → 프롬프트용 {product_name: [tags]}
+            review_tags_for_prompt: Dict[str, Any] = {}
+            if review_tags_data:
+                # recommended_details + searched_details 에서 pid → name 매핑
+                pid_to_name: Dict[int, str] = {}
+                for src in (recommended_details, searched_details):
+                    for item in (src.get("products") or []):
+                        prod = item.get("product") or {}
+                        if prod.get("product_id") and prod.get("product_name"):
+                            pid_to_name[prod["product_id"]] = prod["product_name"]
+                for pid, tags in review_tags_data.items():
+                    name = pid_to_name.get(pid, f"product_id:{pid}")
+                    review_tags_for_prompt[name] = tags
+
+            prompt = build_rag_prompt_with_db_products(
+                user_info,
+                question_str,
+                recommended_products=recommended_details,
+                searched_products=searched_details,
+                review_tags=review_tags_for_prompt or None,
+                comparison_data=comparison_data or None,
+                semantic_results=semantic_results or None,
+            )
+        else:
+            prompt = build_rag_prompt(user_info, question_str)
 
     resp = await llm_json.ainvoke(prompt)
     data_json = _extract_json_from_llm_response(resp)
@@ -1384,22 +1530,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         show_next = _detect_next_recommendation_page_intent(_to_str(question_str))
 
     new_data["show_next_recommendation_page"] = show_next
-    # Spring/프론트 편의 (동일 의미)
     new_data["showNextRecommendationPage"] = show_next
-
-    # 중요:
-    # RECOMMEND_RAG에서 LLM이 "다음 페이지"를 요청하지 않는 경우에는
-    # 프론트가 이미 가지고 있는 추천 리스트를 그대로 쓰면 되므로,
-    # 응답 payload에 recommendation_list 전체를 다시 실어 보내지 않는다.
-    # (그래야 chat 응답(i.e. aiResponse)만 갱신되고 리스트 UI가 "다시" 뜨지 않음)
-    response_data = dict(new_data)
-    # 프론트에서 paging 의도를 판단할 때 굳이 플래그가 필요 없으므로 제거
-    response_data.pop("show_next_recommendation_page", None)
-    response_data.pop("showNextRecommendationPage", None)
-    if not show_next:
-        response_data.pop("recommendation_list", None)
-        response_data.pop("recommendations", None)
-        response_data.pop("recommendationList", None)
 
     messages.append({"role": "assistant", "content": answer_text})
     return {
@@ -1407,7 +1538,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         "step": ChatStep.RECOMMEND_RAG,
         "ai_response": answer_text,
         "messages": messages,
-        "data": response_data,
+        "data": {},
         "is_completed": True,
     }
 
