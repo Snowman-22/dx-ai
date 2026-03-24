@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 
 def build_recommendation_prompt(
@@ -270,5 +270,92 @@ def build_blueprint_rag_prompt(
 }}
 - placements가 비어 있으면 answer에 먼저 스티커를 배치해 달라고 안내하고 warnings에 간단히 표시하세요.
 - 제품명은 과장 없이 필요할 때만 언급합니다.
+"""
+
+
+def build_rag_prompt_with_db_products(
+    user_info: Dict[str, Any],
+    user_question: str,
+    *,
+    recommended_products: Optional[Dict[str, Any]] = None,
+    searched_products: Optional[Dict[str, Any]] = None,
+    review_tags: Optional[Dict[str, Any]] = None,
+    comparison_data: Optional[List[Dict[str, Any]]] = None,
+    semantic_results: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    RECOMMEND_RAG 통합 프롬프트.
+    - 추천 상품 상세 / 키워드 검색 / 리뷰 태그 / 비교표 / 시맨틱 검색 결과를 모두 수용.
+    """
+    rec_json = json.dumps(recommended_products or {}, ensure_ascii=False)
+    search_json = json.dumps(searched_products or {}, ensure_ascii=False)
+    review_json = json.dumps(review_tags or {}, ensure_ascii=False)
+    compare_json = json.dumps(comparison_data or [], ensure_ascii=False)
+    semantic_json = json.dumps(semantic_results or [], ensure_ascii=False)
+
+    # 제공된 데이터만 섹션으로 표시
+    sections = f"""
+[추천된 상품 상세(DB 조회)]
+{rec_json}
+
+[키워드 검색 결과(DB 조회)]
+{search_json}
+"""
+    if review_tags:
+        sections += f"""
+[리뷰 태그(DB 조회) — 상품별 리뷰에서 추출된 핵심 키워드]
+{review_json}
+"""
+    if comparison_data:
+        sections += f"""
+[상품 비교 데이터(DB 조회) — 사용자가 비교를 요청한 상품들의 스펙/가격/리뷰 태그]
+{compare_json}
+"""
+    if semantic_results:
+        sections += f"""
+[유사 상품 검색 결과(벡터 검색) — 질문과 의미적으로 유사한 상품]
+{semantic_json}
+"""
+
+    return f"""
+당신은 자취/소형 공간 전문가 AI 어시스턴트입니다.
+아래는 지금까지 파악한 사용자 정보와, DB에서 조회한 상품 데이터입니다.
+이 정보를 근거로 질문에 답변하세요. (지어내지 말고, 제공된 데이터 위주로 답하세요)
+
+[사용자 정보]
+- 평수: {user_info.get("size")}
+- 라이프스타일: {user_info.get("lifestyle")}
+- 보유 가전: {user_info.get("owned_appliances")}
+- 필요 가전: {user_info.get("needed_appliances")}
+- 새 공간 구매 계획(가구/가전): {user_info.get("purchase_plans")}
+- 가구/소품 추천 필요: {user_info.get("need_furniture")}
+- 가구/소품 요청사항(레거시): {user_info.get("furniture_note")}
+- 인테리어 스타일(레거시): {user_info.get("interior_style")}
+- 예산 입력: {user_info.get("budget_choice") or user_info.get("budget_manwon")}
+- 예산 범위(만원): {user_info.get("budget_range_manwon")}
+{sections}
+[사용자 질문]
+{user_question}
+
+추가 규칙(매우 중요):
+- 위에 제공된 DB 데이터만 사용하세요. 없는 정보를 지어내지 마세요.
+- 사용자가 제품의 '크기/치수/가로/세로/높이/깊이/폭/두께'를 물으면 spec의 width/height/depth 값을 그대로 인용하세요.
+- 스펙이 비어 있으면 추정하지 말고 "정확한 스펙은 확인이 필요합니다"처럼 답하세요.
+- 가격 정보는 original_price(정가), discount_price(할인가), subscribe_prices(구독가)를 구분해서 안내하세요.
+- 리뷰 태그(review_tags)가 제공되면 해당 상품의 사용자 평가 경향(예: "조용하다", "가성비")을 자연스럽게 언급하세요.
+- [상품 비교 데이터]가 있으면 **비교표 형태**(항목별 나열)로 깔끔하게 정리해 주세요.
+- [유사 상품 검색 결과]가 있으면 similarity_score가 높은 순으로 관련도를 언급하세요.
+- 질문과 관련 없는 상품 정보까지 나열하지 마세요. 질문에 해당하는 상품만 답변하세요.
+
+너의 출력은 반드시 아래 JSON 형식이어야 한다.
+
+{{
+  "answer": string,
+  "show_next_recommendation_page": boolean
+}}
+
+- **show_next_recommendation_page**: 사용자가 저장된 추천 목록의 **다음 3개(다음 페이지)** 를 보고 싶다는 뜻이면 true. 그 외 false.
+- **answer**: true 이면 짧은 확인 멘트 + 옆 추천 영역 안내. false 이면 DB 데이터 근거로 답변.
+- 새 패키지를 지어내지 말 것. JSON 외 텍스트 금지.
 """
 
