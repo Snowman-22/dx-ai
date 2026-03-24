@@ -25,7 +25,8 @@ N_PER_THEME         = 4    # 테마별 패키지 수
 N_DISPLAY           = N_THEMES  # _determine_themes용
 MIN_PACKAGES        = 3    # 최종 최소 패키지 수
 MIN_PRODUCTS_PER_PACKAGE = 3  # 패키지당 최소 상품 수
-DIVERSITY_PENALTY   = 0.5   # 이미 등장한 제품 1개당 패널티
+DIVERSITY_PENALTY   = 1.0   # 이미 등장한 제품 1개당 패널티
+MIN_DIFF_RATIO      = 0.3    # 패키지 간 최소 30% 제품이 달라야 함
 
 
 # ================================================================== #
@@ -118,7 +119,7 @@ def generate_packages(results: dict, budget: int) -> list:
     - 5^11 = ~48M 이상이면 TOP_N을 자동으로 줄여서 제한
     """
     MAX_COMBOS = 2_000_000   # numpy 벡터 연산 가능한 한계
-    MAX_PRODUCT_APPEARANCES = 4
+    MAX_PRODUCT_APPEARANCES = 2
 
     candidates = _get_candidates(results)
     if not candidates:
@@ -202,6 +203,10 @@ def generate_packages(results: dict, budget: int) -> list:
     selected       = []
     used_pids      = {}
     cat_pid_counts = {}  # (cat_i, pid) -> count
+    selected_pid_sets = []  # 선택된 패키지별 pid set (차이 비율 계산용)
+
+    # 카테고리 수에 따라 최소 차이 제품 수 계산
+    min_diff_count = max(1, int(n_categories * MIN_DIFF_RATIO))
 
     for scan_i in range(total_combos):
         if len(selected) >= N_PACKAGES:
@@ -209,7 +214,7 @@ def generate_packages(results: dict, budget: int) -> list:
 
         flat_idx = int(sorted_indices[scan_i])
 
-        # 다양성 체크 (dict 생성 없이 numpy 배열로 직접 체크)
+        # 다양성 체크 1: 카테고리별 동일 제품 등장 횟수 제한
         skip = False
         for cat_i in range(n_categories):
             if cat_i in single_cat_indices:
@@ -219,6 +224,23 @@ def generate_packages(results: dict, budget: int) -> list:
                 skip = True
                 break
         if skip:
+            continue
+
+        # 현재 조합의 pid set 구성
+        current_pids = tuple(
+            int(cat_pid_arrays[cat_i][flat_idx]) for cat_i in range(n_categories)
+        )
+        current_pid_set = set(current_pids)
+
+        # 다양성 체크 2: 기존 선택 패키지와 최소 차이 비율 검증
+        too_similar = False
+        for prev_pid_set in selected_pid_sets:
+            overlap = len(current_pid_set & prev_pid_set)
+            diff_count = n_categories - overlap
+            if diff_count < min_diff_count:
+                too_similar = True
+                break
+        if too_similar:
             continue
 
         # 통과한 조합만 dict 생성
@@ -239,6 +261,7 @@ def generate_packages(results: dict, budget: int) -> list:
         })
 
         # 등장 횟수 업데이트
+        selected_pid_sets.append(current_pid_set)
         for cat_i in range(n_categories):
             pid = int(cat_pid_arrays[cat_i][flat_idx])
             cat_pid_counts[(cat_i, pid)] = cat_pid_counts.get((cat_i, pid), 0) + 1
@@ -422,12 +445,30 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
 
         picked_in_theme = 0
         picked_indices  = []
+        theme_pid_sets  = []  # 테마 내 다양성 검증용
 
         for i, _ in scored:
             if picked_in_theme >= N_PER_THEME:
                 break
+
+            # 테마 내 패키지 간 최소 차이 검증
+            cur_keys = _package_product_keys(all_packages[i])
+            n_products = len(all_packages[i].get("products", []))
+            min_diff = max(1, int(n_products * MIN_DIFF_RATIO))
+
+            too_similar = False
+            for prev_keys in theme_pid_sets:
+                overlap = len(cur_keys & prev_keys)
+                diff_count = n_products - overlap
+                if diff_count < min_diff:
+                    too_similar = True
+                    break
+            if too_similar:
+                continue
+
             selected.append({"theme": theme, "package": all_packages[i]})
             picked_indices.append(i)
+            theme_pid_sets.append(cur_keys)
             picked_in_theme += 1
 
         # 선택된 조합을 풀에서 제거
