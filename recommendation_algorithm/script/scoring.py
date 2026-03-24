@@ -119,7 +119,6 @@ def generate_packages(results: dict, budget: int) -> list:
     - 5^11 = ~48M 이상이면 TOP_N을 자동으로 줄여서 제한
     """
     MAX_COMBOS = 2_000_000   # numpy 벡터 연산 가능한 한계
-    MAX_PRODUCT_APPEARANCES = 2
 
     candidates = _get_candidates(results)
     if not candidates:
@@ -128,6 +127,17 @@ def generate_packages(results: dict, budget: int) -> list:
     categories      = list(candidates.keys())
     candidate_lists = [candidates[cat] for cat in categories]
     n_categories    = len(candidate_lists)
+
+    # 카테고리 수에 따라 적응형 다양성 제약
+    if n_categories <= 6:
+        MAX_PRODUCT_APPEARANCES = 2
+        adaptive_diff_ratio = MIN_DIFF_RATIO          # 0.3
+    elif n_categories <= 9:
+        MAX_PRODUCT_APPEARANCES = 3
+        adaptive_diff_ratio = 0.25
+    else:
+        MAX_PRODUCT_APPEARANCES = 4
+        adaptive_diff_ratio = 0.2
 
     # 총 조합 수 계산, 너무 많으면 카테고리당 후보 수를 줄임
     def _calc_total(clists):
@@ -206,7 +216,7 @@ def generate_packages(results: dict, budget: int) -> list:
     selected_pid_sets = []  # 선택된 패키지별 pid set (차이 비율 계산용)
 
     # 카테고리 수에 따라 최소 차이 제품 수 계산
-    min_diff_count = max(1, int(n_categories * MIN_DIFF_RATIO))
+    min_diff_count = max(1, int(n_categories * adaptive_diff_ratio))
 
     for scan_i in range(total_combos):
         if len(selected) >= N_PACKAGES:
@@ -267,6 +277,47 @@ def generate_packages(results: dict, budget: int) -> list:
             cat_pid_counts[(cat_i, pid)] = cat_pid_counts.get((cat_i, pid), 0) + 1
         for pid in pids:
             used_pids[pid] = used_pids.get(pid, 0) + 1
+
+    # 패키지 수가 부족하면 다양성 제약을 단계적으로 완화해서 재시도
+    if len(selected) < N_PACKAGES:
+        relaxed_diff = max(1, min_diff_count - 1)
+        for scan_i in range(total_combos):
+            if len(selected) >= N_PACKAGES:
+                break
+            flat_idx = int(sorted_indices[scan_i])
+
+            current_pids = tuple(
+                int(cat_pid_arrays[cat_i][flat_idx]) for cat_i in range(n_categories)
+            )
+            current_pid_set = set(current_pids)
+
+            # 이미 선택된 조합과 동일한지만 체크 (완화된 기준)
+            too_similar = False
+            for prev_pid_set in selected_pid_sets:
+                overlap = len(current_pid_set & prev_pid_set)
+                diff_count = n_categories - overlap
+                if diff_count < relaxed_diff:
+                    too_similar = True
+                    break
+            if too_similar:
+                continue
+
+            products = [effective_lists[cat_i][idx_arrays[cat_i][flat_idx]]
+                        for cat_i in range(n_categories)]
+            pkg_score   = float(package_scores[flat_idx])
+            total_price = int(price_sum[flat_idx])
+            pids    = [p.get("product_id") for p in products]
+            penalty = sum(used_pids.get(pid, 0) * DIVERSITY_PENALTY for pid in pids)
+
+            selected.append({
+                "products":      products,
+                "package_score": pkg_score,
+                "total_price":   total_price,
+                "adjusted_score": pkg_score - penalty,
+            })
+            selected_pid_sets.append(current_pid_set)
+            for pid in pids:
+                used_pids[pid] = used_pids.get(pid, 0) + 1
 
     return selected
 
@@ -433,6 +484,15 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
     selected  = []
     remaining = list(range(len(all_packages)))  # 아직 선택 안 된 조합 인덱스
 
+    # 카테고리 수 파악 (적응형 다양성 비율 결정)
+    sample_n = len(all_packages[0].get("products", [])) if all_packages else 0
+    if sample_n <= 6:
+        theme_diff_ratio = MIN_DIFF_RATIO
+    elif sample_n <= 9:
+        theme_diff_ratio = 0.25
+    else:
+        theme_diff_ratio = 0.2
+
     for theme in themes:
         scored = sorted(
             [
@@ -447,14 +507,14 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
         picked_indices  = []
         theme_pid_sets  = []  # 테마 내 다양성 검증용
 
+        # 1차: 적응형 다양성 기준으로 선택
         for i, _ in scored:
             if picked_in_theme >= N_PER_THEME:
                 break
 
-            # 테마 내 패키지 간 최소 차이 검증
             cur_keys = _package_product_keys(all_packages[i])
             n_products = len(all_packages[i].get("products", []))
-            min_diff = max(1, int(n_products * MIN_DIFF_RATIO))
+            min_diff = max(1, int(n_products * theme_diff_ratio))
 
             too_similar = False
             for prev_keys in theme_pid_sets:
@@ -470,6 +530,31 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
             picked_indices.append(i)
             theme_pid_sets.append(cur_keys)
             picked_in_theme += 1
+
+        # 2차: 부족하면 다양성 기준 완화 (최소 1개 차이만 요구)
+        if picked_in_theme < N_PER_THEME:
+            for i, _ in scored:
+                if picked_in_theme >= N_PER_THEME:
+                    break
+                if i in picked_indices:
+                    continue
+
+                cur_keys = _package_product_keys(all_packages[i])
+                n_products = len(all_packages[i].get("products", []))
+
+                too_similar = False
+                for prev_keys in theme_pid_sets:
+                    overlap = len(cur_keys & prev_keys)
+                    if n_products - overlap < 1:
+                        too_similar = True
+                        break
+                if too_similar:
+                    continue
+
+                selected.append({"theme": theme, "package": all_packages[i]})
+                picked_indices.append(i)
+                theme_pid_sets.append(cur_keys)
+                picked_in_theme += 1
 
         # 선택된 조합을 풀에서 제거
         for i in picked_indices:
