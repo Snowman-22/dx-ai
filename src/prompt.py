@@ -133,7 +133,7 @@ def build_rag_prompt_with_package_context(
     """
     return f"""
 당신은 자취/소형 공간 전문가 AI 어시스턴트입니다.
-아래는 지금까지 파악한 사용자 정보와, 사용자가 질문한 '특정 추천 패키지'의 상세 정보입니다.
+아래는 지금까지 파악한 사용자 정보와, 추천 패키지에서 고른 상품 또는 사용자가 입력한 상품명으로 DB에서 조회한 상품 상세입니다.
 이 정보를 근거로 질문에 답변하세요. (지어내지 말고, 제공된 데이터 위주로 답하세요)
 도면·배치는 이 단계에서 다루지 않습니다.
 
@@ -282,6 +282,7 @@ def build_rag_prompt_with_db_products(
     review_tags: Optional[Dict[str, Any]] = None,
     comparison_data: Optional[List[Dict[str, Any]]] = None,
     semantic_results: Optional[List[Dict[str, Any]]] = None,
+    followup_instruction: Optional[str] = None,
 ) -> str:
     """
     RECOMMEND_RAG 통합 프롬프트.
@@ -293,8 +294,14 @@ def build_rag_prompt_with_db_products(
     compare_json = json.dumps(comparison_data or [], ensure_ascii=False)
     semantic_json = json.dumps(semantic_results or [], ensure_ascii=False)
 
+    followup_prefix = ""
+    if followup_instruction:
+        followup_prefix = (
+            f"[추가 추천 요청 안내]\n{followup_instruction}\n\n"
+        )
+
     # 제공된 데이터만 섹션으로 표시
-    sections = f"""
+    sections = followup_prefix + f"""
 [추천된 상품 상세(DB 조회)]
 {rec_json}
 
@@ -338,11 +345,15 @@ def build_rag_prompt_with_db_products(
 {user_question}
 
 추가 규칙(매우 중요):
+- [추가 추천 요청 안내]가 있으면 그 의도(다른 가전/가구, 유사 제품, 같은 가격대 등)에 맞춰 [키워드 검색 결과]·[유사 상품 검색 결과]를 우선 활용하세요.
 - 위에 제공된 DB 데이터만 사용하세요. 없는 정보를 지어내지 마세요.
 - 사용자가 제품의 '크기/치수/가로/세로/높이/깊이/폭/두께'를 물으면 spec의 width/height/depth 값을 그대로 인용하세요.
 - 스펙이 비어 있으면 추정하지 말고 "정확한 스펙은 확인이 필요합니다"처럼 답하세요.
 - 가격 정보는 original_price(정가), discount_price(할인가), subscribe_prices(구독가)를 구분해서 안내하세요.
-- 리뷰 태그(review_tags)가 제공되면 해당 상품의 사용자 평가 경향(예: "조용하다", "가성비")을 자연스럽게 언급하세요.
+- 리뷰 태그(review_tags)가 제공되면 해당 상품의 사용자 평가 경향을 말하세요.
+- 리뷰 태그를 쓸 때는 **태그 단어를 따옴표로 쭉 나열하지 말고**, 태그에 나온 의미만 근거로 **완전한 한국어 문장 2~5문장**으로 조합·요약하세요. 태그에 없는 평가·체험은 지어내지 마세요.
+- 리뷰·후기 질문에서 [키워드 검색 결과] 또는 [추천된 상품 상세]의 `product`에 `review_cnt`, `review_score`가 숫자로 들어 있으면, 위 문장형 요약과 함께 **반드시** 리뷰 개수와 평균 평점을 그 숫자 그대로 언급하세요. (예: 총 N개 리뷰, 평균 X점. 값이 없으면 개수·평점을 추정하거나 지어내지 마세요.)
+- 사용자가 리뷰·후기·장단점만 물었을 때는 review_tags와 상품 식별 정보(이름·브랜드)를 중심으로 답하고, spec/subscribe가 비어 있어도 치수·가격을 추정하거나 불필요하게 길게 나열하지 마세요.
 - [상품 비교 데이터]가 있으면 **비교표 형태**(항목별 나열)로 깔끔하게 정리해 주세요.
 - [유사 상품 검색 결과]가 있으면 similarity_score가 높은 순으로 관련도를 언급하세요.
 - 질문과 관련 없는 상품 정보까지 나열하지 마세요. 질문에 해당하는 상품만 답변하세요.

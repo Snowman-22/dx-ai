@@ -15,8 +15,15 @@ from .product_details import (
     fetch_product_review_tags,
     fetch_products_bundle_details,
     fetch_products_comparison,
+    merge_product_bundles,
     search_products_by_keywords,
+    search_products_by_name_query,
     semantic_search_products,
+)
+from .recommend_followup import (
+    FollowupRecommendKind,
+    classify_followup_recommend_intent,
+    run_followup_recommendation_queries,
 )
 from .state_store import get_checkpointer
 from .prompt import (
@@ -186,9 +193,99 @@ FURNITURE_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+# RECOMMEND_RAG: 리뷰·평가 의도(통합 DB 프롬프트 + product_tags 조회 우선 분기)
+REVIEW_INTENT_KEYWORDS: tuple[str, ...] = (
+    "리뷰",
+    "후기",
+    "평가",
+    "평점",
+    "사용후기",
+    "사용기",
+    "만족도",
+    "별점",
+    "장점",
+    "단점",
+    "장단점",
+    "장단",
+    "총평",
+    "솔직후기",
+    "솔직평",
+    "구매후기",
+    "구매평",
+    "실사용",
+    "체험기",
+    "사용평",
+    "사용느낌",
+    "느낌",
+    "입소문",
+    "불만",
+    "칭찬",
+    "평이",
+    "평들",
+    "코멘트",
+    "댓글",
+    "review",
+    "rating",
+    "ratings",
+    "feedback",
+    "testimonial",
+    "testimonials",
+)
+
 # --- 헬퍼 함수들 ---
 def _to_str(x: Any) -> str:
     return str(x).strip() if x is not None else ""
+
+
+def _want_review_intent(text: Any) -> bool:
+    ql = _to_str(text).lower().replace(" ", "")
+    return any(k in ql for k in REVIEW_INTENT_KEYWORDS)
+
+
+def _merge_search_bundle_products(*bundles: Dict[str, Any]) -> Dict[str, Any]:
+    """fetch_products_bundle_details / search 결과 dict들을 product_id(또는 model_id) 기준 병합."""
+    seen: set[tuple[str, Any]] = set()
+    out: List[Dict[str, Any]] = []
+    for b in bundles:
+        if not isinstance(b, dict):
+            continue
+        for item in (b.get("products") or []):
+            if not isinstance(item, dict):
+                continue
+            prod = item.get("product") or {}
+            pid = prod.get("product_id")
+            if pid is not None:
+                try:
+                    key: tuple[str, Any] = ("pid", int(pid))
+                except (TypeError, ValueError):
+                    key = ("mid", _to_str(prod.get("model_id")))
+            else:
+                key = ("mid", _to_str(prod.get("model_id")))
+            if key[1] in (None, ""):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+    return {"products": out}
+
+
+def _product_ids_from_bundle(bundle: Dict[str, Any]) -> List[int]:
+    """fetch_products_bundle_details / search 결과에서 product_id 목록."""
+    out: List[int] = []
+    for item in (bundle.get("products") or []):
+        if not isinstance(item, dict):
+            continue
+        prod = item.get("product") or {}
+        pid = prod.get("product_id")
+        if pid is None:
+            continue
+        try:
+            out.append(int(pid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
 
 def _extract_json_from_llm_response(resp: Any) -> dict[str, Any]:
     import json as _json
@@ -1283,6 +1380,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
     question_str, explicit_pkg_idx = _parse_recommend_rag_user_input(raw_user)
     messages = _append_message(state, role="user", content=raw_user)
     new_data = dict(state.get("data") or {})
+    want_review = _want_review_intent(question_str)
 
     def _extract_package_index(text: str) -> Optional[int]:
         m = re.search(r"(\d+)\s*번", text)
@@ -1304,7 +1402,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             package_idx = None
 
     prompt = None
-    if package_idx is not None:
+    if package_idx is not None and not want_review:
         all_recs = new_data.get("recommendation_list") or []
         if isinstance(all_recs, list) and 0 <= package_idx < len(all_recs):
             pkg = all_recs[package_idx]
@@ -1340,8 +1438,49 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                     except Exception:
                         prompt = None
 
+    # 추천 리스트가 있을 때 '같은 가격대'·'다른 가전' 등 follow-up 의도면,
+    # 질문 전체로 search_products_by_name_query 가 먼저 성공해 prompt 가 고정되면
+    # 통합 분기( run_followup_recommendation_queries )가 스킵되는 문제를 막기 위해 조기 이름 검색을 건너뜀.
+    _all_recs_fu = new_data.get("recommendation_list") or []
+    _has_recs_fu = isinstance(_all_recs_fu, list) and len(_all_recs_fu) > 0
+    _fu_early = classify_followup_recommend_intent(_to_str(question_str))
+    skip_early_catalog_name_search = (
+        _has_recs_fu
+        and not want_review
+        and _fu_early.kind != FollowupRecommendKind.NONE
+        and not _detect_next_recommendation_page_intent(_to_str(question_str))
+    )
+
+    # 사용자 상품명(자유 텍스트) → product 테이블 ILIKE (카탈로그 우선)
+    # 리뷰 질의는 통합 분기에서 상품명 검색 + review_tags 를 함께 넣기 위해 여기서 조기 종료하지 않음
+    if (
+        prompt is None
+        and not want_review
+        and not skip_early_catalog_name_search
+        and _to_str(question_str).strip()
+        and not _detect_next_recommendation_page_intent(_to_str(question_str))
+    ):
+        try:
+            session_maker = get_session_maker()
+            async with session_maker() as session:
+                details = await search_products_by_name_query(session, query=question_str)
+            if (details.get("products") or []):
+                package_context = {
+                    "package_index": None,
+                    "matched_by": "db_product_name_search",
+                    "package_budgets": {},
+                    "products_details": details,
+                }
+                prompt = build_rag_prompt_with_package_context(
+                    user_info,
+                    question_str,
+                    package_context=package_context,
+                )
+        except Exception:
+            prompt = None
+
     # 패키지 인덱스 없이 질문에 상품명이 있으면 recommendation_list에서 매칭 → DB 스펙
-    if prompt is None:
+    if prompt is None and not want_review:
         all_recs = new_data.get("recommendation_list") or []
         mids_name, pkg_by_name = _find_model_ids_by_product_name(question_str, all_recs)
         if mids_name:
@@ -1385,10 +1524,6 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         q_str = _to_str(question_str)
         q_lower = q_str.lower().replace(" ", "")
 
-        want_review = any(k in q_lower for k in (
-            "리뷰", "후기", "평가", "평점", "사용후기", "사용기", "만족도",
-            "별점", "장점", "단점", "review",
-        ))
         want_compare = any(k in q_lower for k in (
             "비교", "차이", "뭐가다", "뭐가나", "어떤게나", "어떤게더",
             "vs", "차이점", "비교해", "비교좀",
@@ -1432,35 +1567,81 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         review_tags_data: Dict[int, List[str]] = {}
         comparison_data: List[Dict[str, Any]] = []
         semantic_results: List[Dict[str, Any]] = []
+        followup_instruction: Optional[str] = None
+        skip_generic_semantic = False
+
+        has_recs = isinstance(all_recs, list) and len(all_recs) > 0
+        fu_intent = _fu_early
+        fu_active = (
+            not want_review
+            and has_recs
+            and fu_intent.kind != FollowupRecommendKind.NONE
+            and not _detect_next_recommendation_page_intent(_to_str(question_str))
+        )
 
         try:
             session_maker = get_session_maker()
             async with session_maker() as session:
-                # 1) 추천 상품 상세
-                if rec_model_ids:
-                    recommended_details = await fetch_products_bundle_details(
-                        session, model_ids=rec_model_ids
-                    )
-
-                # 2) 키워드 검색
-                if search_keywords:
-                    searched_details = await search_products_by_keywords(
-                        session, keywords=search_keywords, limit=10
-                    )
-
-                # 3) 리뷰 태그 조회
                 if want_review:
-                    all_pids = list(set(rec_product_ids))
-                    # searched 결과의 product_id도 추가
-                    for sp in (searched_details.get("products") or []):
-                        sprod = sp.get("product") or {}
-                        spid = sprod.get("product_id")
-                        if spid is not None and spid not in all_pids:
-                            all_pids.append(spid)
+                    # 리뷰: product 테이블 상품명 검색 → 그 product_id로만 product_tags 조회
+                    recommended_details = {"products": []}
+                    searched_details = {"products": []}
+                    q_ok = (
+                        _to_str(question_str).strip()
+                        and not _detect_next_recommendation_page_intent(
+                            _to_str(question_str)
+                        )
+                    )
+                    if q_ok:
+                        searched_details = await search_products_by_name_query(
+                            session,
+                            query=question_str,
+                            include_spec_and_prices=False,
+                        )
+                    # 상품명 매칭 실패 시에만 키워드로 보조 (가습기 등 광역 검색)
+                    if not (searched_details.get("products") or []) and search_keywords:
+                        searched_details = await search_products_by_keywords(
+                            session,
+                            keywords=search_keywords,
+                            limit=10,
+                            include_spec_and_prices=False,
+                        )
+
+                    all_pids = _product_ids_from_bundle(searched_details)
+                    if not all_pids:
+                        all_pids = list(set(rec_product_ids))
                     if all_pids:
                         review_tags_data = await fetch_product_review_tags(
                             session, product_ids=all_pids
                         )
+                else:
+                    # 1) 추천 상품 상세
+                    if rec_model_ids:
+                        recommended_details = await fetch_products_bundle_details(
+                            session, model_ids=rec_model_ids
+                        )
+
+                    # 2) 키워드 검색
+                    if search_keywords:
+                        searched_details = await search_products_by_keywords(
+                            session, keywords=search_keywords, limit=10
+                        )
+
+                    # 2b) 추천 리스트 보유 후 추가 추천 의도(다른 가전/가구, 유사, 같은 가격대 등)
+                    if fu_active:
+                        fb, sem_fu, note_fu = await run_followup_recommendation_queries(
+                            session, fu_intent, question_str
+                        )
+                        if note_fu.strip():
+                            followup_instruction = note_fu
+                        if fb.get("products"):
+                            searched_details = merge_product_bundles(
+                                searched_details, fb
+                            )
+                        if sem_fu is not None:
+                            semantic_results = sem_fu
+                        if fu_intent.kind == FollowupRecommendKind.SIMILAR_PRODUCT:
+                            skip_generic_semantic = True
 
                 # 4) 상품 비교
                 if want_compare and rec_model_ids:
@@ -1469,7 +1650,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                     )
 
                 # 5) 시맨틱(벡터) 검색
-                if want_semantic:
+                if want_semantic and not skip_generic_semantic:
                     try:
                         from openai import AsyncOpenAI
                         import os
@@ -1493,6 +1674,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             or review_tags_data
             or comparison_data
             or semantic_results
+            or bool(followup_instruction)
         )
 
         if has_any_data:
@@ -1518,6 +1700,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                 review_tags=review_tags_for_prompt or None,
                 comparison_data=comparison_data or None,
                 semantic_results=semantic_results or None,
+                followup_instruction=followup_instruction,
             )
         else:
             prompt = build_rag_prompt(user_info, question_str)
