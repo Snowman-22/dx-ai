@@ -305,13 +305,26 @@ def _effective_price(p: dict, prefer_subscription: bool = False) -> int:
     prefer_subscription=True: 구독 가능 제품은 구독 총비용(월×개월) 사용.
     (예산 부족 시 자동 활성화)
     """
-    use_sub = p.get("subscription_price") and (
+    sub_price = p.get("subscription_price")
+    # NaN / None 체크
+    try:
+        sub_price_valid = sub_price is not None and int(float(sub_price)) > 0
+    except (TypeError, ValueError):
+        sub_price_valid = False
+
+    use_sub = sub_price_valid and (
         p.get("subscribe_recommended") or prefer_subscription
     )
     if use_sub:
         years = p.get("contract_period_year") or 3
-        return int(p["subscription_price"]) * int(years) * 12
-    return int(p.get("price", 0))
+        try:
+            return int(float(sub_price)) * int(float(years)) * 12
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(float(p.get("price", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _calc_package_score(products: list, budget: int) -> float:
