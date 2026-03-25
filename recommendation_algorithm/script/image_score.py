@@ -176,9 +176,14 @@ def calc_image_scores(
 
 def calc_final_score_furniture(df: pd.DataFrame) -> pd.DataFrame:
     """
-    FinalScore = 0.6 * derived_score + 0.4 * image_score
-    df: derived_score, image_score 컬럼 필요
+    FinalScore = w_derived * derived_score + w_image * image_score
+    스타일 선택 시: 0.6 / 0.4 (이미지 유사도 반영)
+    스타일 미선택 시: 0.85 / 0.15 (image_score가 전부 0.5 중립이므로 비중 축소)
     """
     df = df.copy()
-    df["final_score"] = 0.6 * df["derived_score"] + 0.4 * df["image_score"]
+    all_neutral = (df["image_score"] == 0.5).all() if not df.empty else True
+    if all_neutral:
+        df["final_score"] = 0.85 * df["derived_score"] + 0.15 * df["image_score"]
+    else:
+        df["final_score"] = 0.6 * df["derived_score"] + 0.4 * df["image_score"]
     return df

@@ -78,29 +78,36 @@ APPLIANCE_KEYWORDS: dict[str, list[str]] = {
     "에어컨": [
         "에어컨", "벽걸이에어컨", "스탠드에어컨", "사계절에어컨",
         "2in1에어컨", "벽걸이형 에어컨", "스탠드형 에어컨", "휘센",
+        "air-conditioner", "air conditioner",
     ],
     "세탁기": [
         "세탁기", "드럼세탁기", "드럼 세탁기", "통돌이세탁기", "통돌이 세탁기",
         "통돌이", "미니워시", "워시타워", "워시콤보", "트롬 세탁기",
+        "washer",
     ],
-    "건조기": [
+    "의류건조기": [
         "건조기", "의류건조기", "의류 건조기", "트롬 건조기", "건조기세트",
+        "dryer",
     ],
     "냉장고": [
         "냉장고", "양문형냉장고", "양문형 냉장고", "일반냉장고", "일반 냉장고",
         "김치냉장고", "김치 냉장고", "냉동고", "프렌치도어", "매직스페이스",
         "더블매직스페이스", "노크온", "디오스", "무드업",
+        "refrigerator",
     ],
     "공기청정기": [
         "공기청정기", "공청기", "에어로타워", "퓨리케어", "퓨리케어 공기청정기",
+        "air-purifier", "air purifier",
     ],
     "정수기": [
         "정수기", "얼음정수기", "냉온정수기", "냉온정", "냉정수기", "온정수기",
         "정수전용", "정수기기", "퓨리케어 정수기",
+        "water-purifier", "water purifier",
     ],
     "청소기": [
         "청소기", "로봇청소기", "무선청소기", "유선청소기", "스틱청소기",
         "코드제로", "로보킹", "사이킹",
+        "vacuum",
     ],
     "제습기": [
         "제습기", "대용량제습기", "소형제습기",
@@ -110,18 +117,23 @@ APPLIANCE_KEYWORDS: dict[str, list[str]] = {
     ],
     "식기세척기": [
         "식기세척기", "식세기", "빌트인 식기세척기", "프리스탠딩 식기세척기",
+        "dishwasher",
     ],
     "전기레인지": [
         "전기레인지", "인덕션", "하이브리드레인지", "레인지", "빌트인 레인지",
+        "induction",
     ],
     "전자레인지": [
         "전자레인지", "전자 레인지",
+        "microwave",
     ],
     "오븐": [
         "오븐", "광파오븐", "광파 오븐", "전자오븐",
+        "oven",
     ],
     "의류관리기": [
         "의류관리기", "스타일러", "스티머", "의류 케어기",
+        "clothing-care", "clothing care",
     ],
     "밥솥": [
         "밥솥", "전기밥솥", "압력밥솥", "쿠쿠 밥솥",
@@ -144,42 +156,36 @@ FURNITURE_KEYWORDS: dict[str, list[str]] = {
         "가드침대", "유아침대", "싱글침대", "슈퍼싱글침대", "퀸침대",
         "킹침대", "라지킹침대",
     ],
-    "매트리스": [
+    "매트리스·토퍼": [
         "매트리스", "토퍼", "스프링매트리스", "라텍스매트리스",
         "싱글 매트리스", "퀸 매트리스", "킹 매트리스",
     ],
-    "식탁": [
+    "식탁·테이블": [
         "식탁", "세라믹식탁", "원형식탁", "타원형식탁", "4인식탁", "6인식탁",
         "2인식탁", "다이닝테이블", "원목식탁", "마블식탁",
-    ],
-    "테이블": [
         "테이블", "사이드테이블", "티테이블", "소파테이블", "소파탁자",
         "거실테이블", "커피테이블", "야외테이블",
     ],
-    "수납장": [
+    "책장·수납장": [
         "수납장", "서랍장", "장식장", "진열장", "선반장", "수납선반", "와이드서랍장",
         "사이드보드", "이동식수납", "캐비닛", "콘솔장",
-    ],
-    "책장": [
         "책장", "북케이스", "오픈책장", "책꽂이",
     ],
-    "옷장": [
+    "옷장·행거": [
         "옷장", "행거형옷장", "서랍형옷장", "거울옷장", "붙박이장",
+        "행거", "옷행거", "코트행거", "드레스룸", "스탠드행거",
     ],
     "책상": [
         "책상", "데스크", "서재책상", "컴퓨터책상", "학생책상", "1인책상",
         "파티션책상", "작업책상",
     ],
-    "거실장": [
+    "TV거실장": [
         "거실장", "tv거실장", "tv장", "tv콘솔", "tv캐비넷", "tv선반", "미디어콘솔",
-    ],
-    "행거": [
-        "행거", "옷행거", "코트행거", "드레스룸", "스탠드행거",
     ],
     "선반": [
         "선반", "벽선반", "모니터선반", "책상선반", "수납선반",
     ],
-    "화장대": [
+    "화장대·콘솔": [
         "화장대", "거울화장대", "콘솔", "콘솔선반",
     ],
     "협탁": [
@@ -754,6 +760,27 @@ def _match_keywords(text: str, mapping: dict[str, list[str]]) -> list[str]:
     return _unique_keep_order(matched)
 
 
+def _normalize_appliance_names(items: list[str]) -> list[str]:
+    """
+    프론트 영어 ID 또는 한국어 별칭 → DB 카테고리명(한국어) 변환.
+    매핑에 없는 값은 그대로 유지.
+    """
+    # 역방향 매핑: alias → canonical (소문자 기준)
+    alias_to_canonical: dict[str, str] = {}
+    for canonical, aliases in APPLIANCE_KEYWORDS.items():
+        alias_to_canonical[canonical.lower()] = canonical
+        for alias in aliases:
+            alias_to_canonical[alias.lower()] = canonical
+
+    normalized = []
+    for item in items:
+        key = _to_str(item).strip().lower()
+        canonical = alias_to_canonical.get(key, item)
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
+
+
 async def _classify_chat5_items(user_text: Any) -> dict[str, list[str]]:
     text = _to_str(user_text)
     if not text:
@@ -866,14 +893,18 @@ def node_chat_2(state: ChatState) -> ChatState:
 
     if isinstance(user_text, dict):
         if "owned" in user_text:
-            user_info["owned_appliances"] = _extract_owned_list({"owned": user_text.get("owned")})
+            user_info["owned_appliances"] = _normalize_appliance_names(
+                _extract_owned_list({"owned": user_text.get("owned")})
+            )
         if _dict_has_needed_key(user_text):
-            user_info["needed_appliances"] = _extract_needed_list(
-                {"needed": _get_needed_raw_from_dict(user_text)}
+            user_info["needed_appliances"] = _normalize_appliance_names(
+                _extract_needed_list({"needed": _get_needed_raw_from_dict(user_text)})
             )
     else:
         # 프론트가 문자열로만 보내는 경우(방어)
-        user_info["needed_appliances"] = _extract_needed_list(user_text)
+        user_info["needed_appliances"] = _normalize_appliance_names(
+            _extract_needed_list(user_text)
+        )
 
     return {
         **state,
