@@ -1916,7 +1916,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         "step": ChatStep.RECOMMEND_RAG,
         "ai_response": answer_text,
         "messages": messages,
-        "data": {},
+        "data": new_data,
         "is_completed": True,
     }
 
