@@ -110,6 +110,112 @@ def _get_candidates(results: dict) -> dict:
     return candidates
 
 
+def _get_theme_candidates(reranked: dict, theme: str) -> dict:
+    """테마별로 다른 정렬 기준으로 후보 선정 (멀티 전략 앙상블)"""
+    candidates = {}
+    for cat, df in reranked.items():
+        if df.empty:
+            continue
+        df = df.copy()
+        score_col = "final_score" if "final_score" in df.columns else "derived_score"
+
+        # 테마별 보조 점수 계산
+        if theme == "가성비":
+            vs = df["value_score"].fillna(5.0) / 10.0 if "value_score" in df.columns else 0.5
+            dr = df["discount_rate"].fillna(0) / 100.0 if "discount_rate" in df.columns else 0.0
+            df["_sort"] = 0.4 * df[score_col] + 0.3 * vs + 0.3 * dr
+        elif theme == "프리미엄":
+            prem = pd.Series(0.0, index=df.index)
+            if "premium_line" in df.columns:
+                prem = df["premium_line"].isin(["오브제", "시그니처"]).astype(float)
+            if "material_grade" in df.columns:
+                prem = np.maximum(prem, (df["material_grade"] == "프리미엄").astype(float))
+            df["_sort"] = 0.5 * df[score_col] + 0.5 * prem
+        elif theme == "효율":
+            energy = df["energy_grade"].isin(["1등급", "2등급"]).astype(float) if "energy_grade" in df.columns else 0.0
+            sub = df["is_subscribe"].fillna(False).astype(float) if "is_subscribe" in df.columns else 0.0
+            df["_sort"] = 0.5 * df[score_col] + 0.3 * energy + 0.2 * sub
+        elif theme == "펫 프렌들리":
+            pet = df["pet_score"].fillna(0) / 5.0 if "pet_score" in df.columns else 0.0
+            df["_sort"] = 0.5 * df[score_col] + 0.5 * pet
+        elif theme == "공간 최적화":
+            space = df["space_saving_score"].fillna(0) / 5.0 if "space_saving_score" in df.columns else 0.0
+            small = (df["size_grade"] == "소").astype(float) if "size_grade" in df.columns else 0.0
+            df["_sort"] = 0.4 * df[score_col] + 0.3 * space + 0.3 * small
+        elif theme == "친환경":
+            eco = df["is_eco_friendly"].fillna(False).astype(float) if "is_eco_friendly" in df.columns else 0.0
+            df["_sort"] = 0.5 * df[score_col] + 0.5 * eco
+        else:  # 밸런스
+            df["_sort"] = df[score_col].copy()
+
+        df = df.sort_values("_sort", ascending=False)
+
+        # 브랜드 다양성 적용
+        unique_brands = df["brand"].dropna().nunique() if "brand" in df.columns else 0
+        apply_brand_limit = unique_brands >= 2
+        selected = []
+        brand_count = {}
+        for _, row in df.iterrows():
+            if len(selected) >= TOP_N_PER_CATEGORY:
+                break
+            brand = str(row.get("brand", "") or "").strip()
+            if apply_brand_limit and brand and brand_count.get(brand, 0) >= MAX_PER_BRAND:
+                continue
+            selected.append(row.to_dict())
+            if brand:
+                brand_count[brand] = brand_count.get(brand, 0) + 1
+        candidates[cat] = selected
+
+    return candidates
+
+
+def _greedy_pick_packages(
+    packages: list,
+    n: int,
+    existing_themed: list,
+    global_product_keys: set,
+) -> list:
+    """탐욕적으로 n개 패키지 선택, 기존 패키지와 다양성 유지"""
+    selected = []
+    local_keys = set()
+
+    for pkg in packages:
+        if len(selected) >= n:
+            break
+
+        keys = _package_product_keys(pkg)
+        if not keys:
+            continue
+
+        # 시그니처 중복 체크 (동일 조합 방지)
+        sig = _package_signature(pkg)
+        if any(_package_signature(tp["package"]) == sig for tp in existing_themed):
+            continue
+
+        # 같은 테마 내 다양성: 기존 선택과 30% 이상 새 제품
+        if local_keys:
+            new_ratio = len(keys - local_keys) / len(keys)
+            if new_ratio < 0.3:
+                continue
+
+        selected.append(pkg)
+        local_keys |= keys
+
+    # 부족하면 다양성 완화해서 채움
+    if len(selected) < n:
+        for pkg in packages:
+            if len(selected) >= n:
+                break
+            sig = _package_signature(pkg)
+            if any(_package_signature(s) == sig for s in selected):
+                continue
+            if any(_package_signature(tp["package"]) == sig for tp in existing_themed):
+                continue
+            selected.append(pkg)
+
+    return selected
+
+
 def _effective_price(p: dict) -> int:
     """구독 추천 제품은 구독 총비용, 일반 제품은 할인가 반환"""
     if p.get("subscribe_recommended") and p.get("subscription_price"):
@@ -142,16 +248,18 @@ def _calc_package_score(products: list, budget: int) -> float:
     return 0.8 * avg_score + 0.2 * budget_fit
 
 
-def generate_packages(results: dict, budget: int) -> list:
+def generate_packages(results: dict, budget: int, candidates: dict = None, max_packages: int = None) -> list:
     """
     numpy 벡터화 전수탐색으로 조합 생성
-    - 모든 조합의 점수/가격을 numpy 배열로 한번에 계산
-    - 복잡도: O(total_combos) but 벡터 연산으로 빠름
-    - 5^11 = ~48M 이상이면 TOP_N을 자동으로 줄여서 제한
+    - candidates: 미리 선정된 후보 (None이면 _get_candidates 사용)
+    - max_packages: 생성할 최대 패키지 수 (None이면 N_PACKAGES 사용)
     """
-    MAX_COMBOS = 2_000_000   # numpy 벡터 연산 가능한 한계
+    MAX_COMBOS = 2_000_000
+    if max_packages is None:
+        max_packages = N_PACKAGES
 
-    candidates = _get_candidates(results)
+    if candidates is None:
+        candidates = _get_candidates(results)
     if not candidates:
         return []
 
@@ -291,7 +399,7 @@ def generate_packages(results: dict, budget: int) -> list:
         return set(int(cat_pid_arrays[ci][flat_idx]) for ci in group_indices)
 
     for scan_i in range(total_combos):
-        if len(selected) >= N_PACKAGES:
+        if len(selected) >= max_packages:
             break
 
         flat_idx = int(sorted_indices[scan_i])
@@ -351,11 +459,11 @@ def generate_packages(results: dict, budget: int) -> list:
             used_pids[pid] = used_pids.get(pid, 0) + 1
 
     # 패키지 수가 부족하면 다양성 제약을 단계적으로 완화해서 재시도
-    if len(selected) < N_PACKAGES:
+    if len(selected) < max_packages:
         relaxed_elec = max(1, min_elec_diff - 1) if min_elec_diff > 1 else 0
         relaxed_furn = max(1, min_furn_diff - 1) if min_furn_diff > 1 else 0
         for scan_i in range(total_combos):
-            if len(selected) >= N_PACKAGES:
+            if len(selected) >= max_packages:
                 break
             flat_idx = int(sorted_indices[scan_i])
 
@@ -825,21 +933,51 @@ def run_scoring(
     use_llm: bool = True,
 ) -> dict:
     """
-    재정렬 → 조합 생성 → 추천 이유 생성 → 출력 포맷 변환
+    멀티 전략 앙상블 + 탐욕 다양성 구성.
+    테마별로 다른 후보를 선정하고, 탐욕적으로 다양한 패키지를 구성.
     """
     preferences = preferences or []
 
     # 1. 재정렬
     reranked = rerank(results)
 
-    # 2. 전체 조합 생성 (다양성 패널티 적용)
-    all_packages = generate_packages(reranked, budget)
+    # 2. 테마 결정
+    themes = _determine_themes(preferences)
 
-    # 3. 테마별 패키지 선별
-    themed_packages = select_themed_packages(all_packages, preferences, budget)
-    themed_packages = _enforce_minimum_output(themed_packages, all_packages, reranked)
+    # 3. 멀티 전략 앙상블 + 탐욕 다양성 구성
+    themed_packages = []
+    global_product_keys = set()
 
-    # 4. 추천 이유 생성
+    for theme in themes:
+        # 테마별 후보 선정 (다른 정렬 기준)
+        theme_candidates = _get_theme_candidates(reranked, theme)
+
+        # 테마별 조합 생성 (풀 20개)
+        packages = generate_packages(
+            reranked, budget,
+            candidates=theme_candidates,
+            max_packages=20,
+        )
+
+        # 테마 점수로 재정렬
+        for pkg in packages:
+            pkg["theme_score"] = _score_by_theme(pkg, theme, budget)
+        packages.sort(key=lambda p: p["theme_score"], reverse=True)
+
+        # 탐욕적으로 4개 선택
+        picked = _greedy_pick_packages(
+            packages, N_PER_THEME, themed_packages, global_product_keys,
+        )
+        for pkg in picked:
+            themed_packages.append({"theme": theme, "package": pkg})
+            global_product_keys |= _package_product_keys(pkg)
+
+    # 4. 최소 12개 보장 — 부족하면 밸런스 풀에서 추가
+    if len(themed_packages) < MIN_PACKAGES:
+        fallback = generate_packages(reranked, budget)
+        themed_packages = _enforce_minimum_output(themed_packages, fallback, reranked)
+
+    # 5. 추천 이유 생성
     if use_llm and themed_packages:
         pkg_list = [item["package"] for item in themed_packages]
         themes   = [item["theme"] for item in themed_packages]
