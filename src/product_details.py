@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 
+import logging
 import re
 
 from sqlalchemy import and_, case, func, or_, select
@@ -16,6 +17,8 @@ from .products_repo import (
     SubscribePriceEntity,
     vector_search_products,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def fetch_products_bundle_details(
@@ -40,7 +43,9 @@ async def fetch_products_bundle_details(
     """
     model_id_list = [m for m in (str(x).strip() for x in model_ids) if m]
     if not model_id_list:
+        logger.info("fetch_products_bundle_details: empty model_ids")
         return {"products": []}
+    logger.info("fetch_products_bundle_details: requested model_ids=%s", model_id_list)
 
     # 1) product 조회
     prod_rows = (
@@ -54,6 +59,10 @@ async def fetch_products_bundle_details(
 
     product_ids = list(by_product_id.keys())
     if not product_ids:
+        logger.info(
+            "fetch_products_bundle_details: no product rows for model_ids=%s",
+            model_id_list,
+        )
         return {"products": []}
 
     # 2) spec 조회
@@ -81,9 +90,24 @@ async def fetch_products_bundle_details(
     for mid in model_id_list:
         p = by_model_id.get(mid)
         if not p:
+            logger.info(
+                "fetch_products_bundle_details: missing product row for model_id=%s",
+                mid,
+            )
             continue
         spec = spec_by_product_id.get(p.product_id)
         subs = subs_by_product_id.get(p.product_id, [])
+        logger.info(
+            "fetch_products_bundle_details: model_id=%s product_id=%s product_name=%s spec_found=%s width=%s height=%s depth=%s subscribe_count=%s",
+            p.model_id,
+            p.product_id,
+            p.product_name,
+            spec is not None,
+            None if spec is None else spec.width,
+            None if spec is None else spec.height,
+            None if spec is None else spec.depth,
+            len(subs),
+        )
 
         out.append(
             {
@@ -342,8 +366,10 @@ async def search_products_by_name_query(
     """
     segments = _split_product_name_segments(query)
     if not segments:
+        logger.info("search_products_by_name_query: no segments for query=%r", query)
         return {"products": []}
     segments = segments[:max_segments]
+    logger.info("search_products_by_name_query: query=%r segments=%s", query, segments)
 
     collected: list[str] = []
     seen: set[str] = set()
@@ -352,6 +378,13 @@ async def search_products_by_name_query(
         norm_seg = _normalize_query_segment(seg)
         safe = _safe_like_fragment(norm_seg)
         tokens = _extract_search_tokens(seg)[:6]
+        logger.info(
+            "search_products_by_name_query: segment=%r normalized=%r safe=%r tokens=%s",
+            seg,
+            norm_seg,
+            safe,
+            tokens,
+        )
 
         phrase_conditions = []
         if len(safe) >= 2:
@@ -376,6 +409,18 @@ async def search_products_by_name_query(
             )
             rows = list(res.scalars().all())
             if rows:
+                logger.info(
+                    "search_products_by_name_query: phrase-match segment=%r matched=%s",
+                    seg,
+                    [
+                        {
+                            "model_id": r.model_id,
+                            "product_id": r.product_id,
+                            "product_name": r.product_name,
+                        }
+                        for r in rows
+                    ],
+                )
                 return rows
 
         if not tokens:
@@ -416,7 +461,20 @@ async def search_products_by_name_query(
             .limit(limit_per_segment)
         )
         res2 = await session.execute(stmt)
-        return list(res2.scalars().all())
+        rows2 = list(res2.scalars().all())
+        logger.info(
+            "search_products_by_name_query: token-match segment=%r matched=%s",
+            seg,
+            [
+                {
+                    "model_id": r.model_id,
+                    "product_id": r.product_id,
+                    "product_name": r.product_name,
+                }
+                for r in rows2
+            ],
+        )
+        return rows2
 
     for seg in segments:
         for p in await _rows_for_segment(seg):
@@ -426,7 +484,13 @@ async def search_products_by_name_query(
                 collected.append(mid)
 
     if not collected:
+        logger.info("search_products_by_name_query: no collected model_ids for query=%r", query)
         return {"products": []}
+    logger.info(
+        "search_products_by_name_query: collected model_ids for query=%r => %s",
+        query,
+        collected,
+    )
 
     if not include_spec_and_prices:
         res = await session.execute(
@@ -505,7 +569,9 @@ async def fetch_product_review_tags(
     """
     pid_list = list(product_ids)
     if not pid_list:
+        logger.info("fetch_product_review_tags: empty product_ids")
         return {}
+    logger.info("fetch_product_review_tags: requested product_ids=%s", pid_list)
 
     rows = (
         await session.execute(
@@ -515,7 +581,12 @@ async def fetch_product_review_tags(
         )
     ).scalars().all()
 
-    return {r.product_id: (r.tags or []) for r in rows}
+    result = {r.product_id: (r.tags or []) for r in rows}
+    logger.info(
+        "fetch_product_review_tags: fetched=%s",
+        {pid: len(tags) for pid, tags in result.items()},
+    )
+    return result
 
 
 # ── 상품 비교 (여러 상품의 스펙/가격을 한 번에) ─────────────────────
@@ -533,6 +604,7 @@ async def fetch_products_comparison(
     details = await fetch_products_bundle_details(session, model_ids=model_ids)
     products = details.get("products") or []
     if not products:
+        logger.info("fetch_products_comparison: no products for model_ids=%s", list(model_ids))
         return []
 
     pid_list = [
@@ -541,6 +613,11 @@ async def fetch_products_comparison(
         if isinstance(p, dict) and isinstance(p.get("product"), dict)
     ]
     tags_map = await fetch_product_review_tags(session, product_ids=pid_list)
+    logger.info(
+        "fetch_products_comparison: compared product_ids=%s tag_counts=%s",
+        pid_list,
+        {pid: len(tags_map.get(pid, [])) for pid in pid_list},
+    )
 
     for item in products:
         prod = item.get("product") or {}
@@ -617,7 +694,14 @@ async def search_products_by_keywords(
     include_spec_and_prices=False 이면 product 행만 — 리뷰 RAG 보조 검색용.
     """
     if not keywords:
+        logger.info("search_products_by_keywords: empty keywords")
         return {"products": []}
+    logger.info(
+        "search_products_by_keywords: keywords=%s limit=%s include_spec_and_prices=%s",
+        keywords,
+        limit,
+        include_spec_and_prices,
+    )
 
     conditions = []
     for kw in keywords:
@@ -631,6 +715,7 @@ async def search_products_by_keywords(
         conditions.append(ProductEntity.brand.ilike(like))
 
     if not conditions:
+        logger.info("search_products_by_keywords: no valid conditions for keywords=%s", keywords)
         return {"products": []}
 
     prod_rows = (
@@ -640,7 +725,19 @@ async def search_products_by_keywords(
     ).scalars().all()
 
     if not prod_rows:
+        logger.info("search_products_by_keywords: no matches for keywords=%s", keywords)
         return {"products": []}
+    logger.info(
+        "search_products_by_keywords: matched=%s",
+        [
+            {
+                "model_id": p.model_id,
+                "product_id": p.product_id,
+                "product_name": p.product_name,
+            }
+            for p in prod_rows
+        ],
+    )
 
     if not include_spec_and_prices:
         return {
