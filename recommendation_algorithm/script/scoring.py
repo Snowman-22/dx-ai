@@ -58,10 +58,8 @@ DEFAULT_THEMES = ["밸런스", "가성비", "프리미엄"]
 
 def rerank(results: dict) -> dict:
     """
-    카테고리별 df에서 is_subscribe=True 제품을 상단으로 재정렬
-    정렬 기준:
-        1순위: is_subscribe (True 먼저)
-        2순위: final_score 내림차순
+    카테고리별 df에서 구독 가능 제품을 상단으로 재정렬하되,
+    상위 50%만 구독 우선 배치하여 비구독 고품질 제품도 후보에 남도록 함.
     """
     reranked = {}
     for cat, df in results.items():
@@ -70,10 +68,11 @@ def rerank(results: dict) -> dict:
 
         if "is_subscribe" in df.columns:
             df["is_subscribe"] = df["is_subscribe"].fillna(False).astype(bool)
-            df = df.sort_values(
-                ["is_subscribe", score_col],
-                ascending=[False, False]
-            ).reset_index(drop=True)
+            # 구독 우선 슬롯: 후보 수의 50% (최소 2, 최대 TOP_N의 절반)
+            max_sub_slots = max(2, TOP_N_PER_CATEGORY // 2)
+            sub_df = df[df["is_subscribe"]].sort_values(score_col, ascending=False).head(max_sub_slots)
+            nonsub_df = df[~df.index.isin(sub_df.index)].sort_values(score_col, ascending=False)
+            df = pd.concat([sub_df, nonsub_df]).reset_index(drop=True)
         else:
             df = df.sort_values(score_col, ascending=False).reset_index(drop=True)
 
@@ -181,12 +180,31 @@ def generate_packages(results: dict, budget: int) -> list:
 
     effective_lists = [list(cl) for cl in candidate_lists]
     while _calc_total(effective_lists) > MAX_COMBOS:
-        # 가장 후보가 많은 카테고리에서 1개씩 줄임
-        max_len = max(len(cl) for cl in effective_lists)
-        for cl in effective_lists:
-            if len(cl) == max_len:
-                cl.pop()
-                break
+        # 가구 카테고리부터 먼저 축소하여 가전 다양성 유지
+        max_furn_len = 0
+        max_furn_idx = -1
+        max_elec_len = 0
+        max_elec_idx = -1
+        for ci, cl in enumerate(effective_lists):
+            if len(cl) <= 1:
+                continue
+            if categories[ci] in ELECTRONICS_CATEGORIES:
+                if len(cl) > max_elec_len:
+                    max_elec_len = len(cl)
+                    max_elec_idx = ci
+            else:
+                if len(cl) > max_furn_len:
+                    max_furn_len = len(cl)
+                    max_furn_idx = ci
+        # 가구 먼저 축소, 가구가 더 줄일 수 없으면 가전 축소
+        if max_furn_idx >= 0 and max_furn_len > 2:
+            effective_lists[max_furn_idx].pop()
+        elif max_elec_idx >= 0:
+            effective_lists[max_elec_idx].pop()
+        elif max_furn_idx >= 0:
+            effective_lists[max_furn_idx].pop()
+        else:
+            break
         if all(len(cl) <= 1 for cl in effective_lists):
             break
 

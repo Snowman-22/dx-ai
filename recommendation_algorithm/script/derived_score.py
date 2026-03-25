@@ -557,8 +557,14 @@ def calc_electronics_derived_score(
     starter_mult = STARTER_MULT["electronics"].get(starter_package, {g: 1.0 for g in BASE_WEIGHT["electronics"]})
     base_w = BASE_WEIGHT["electronics"]
     raw_weights = {g: base_w[g] * starter_mult.get(g, 1.0) for g in base_w}
+
+    # G6 비활성(스타일 미선택) 시 가중치 0 → G1~G5에 재분배
+    g6_active = any(col_weights.get(col, 0.0) > 0 for col, _ in G6_cols)
+    if not g6_active:
+        raw_weights["G6"] = 0.0
+
     total = sum(raw_weights.values())
-    norm_weights = {g: w / total for g, w in raw_weights.items()}
+    norm_weights = {g: w / total for g, w in raw_weights.items()} if total > 0 else {g: 0.0 for g in raw_weights}
 
     return float(np.clip(sum(group_scores[g] * norm_weights[g] for g in group_scores), 0.0, 1.0))
 
@@ -633,7 +639,13 @@ def calc_furniture_derived_score(
     starter_mult = STARTER_MULT["furniture"].get(starter_package, {g: 1.0 for g in BASE_WEIGHT["furniture"]})
     base_w = BASE_WEIGHT["furniture"]
     raw_weights = {g: base_w[g] * starter_mult.get(g, 1.0) for g in base_w}
+
+    # G6 비활성(스타일 미선택) 시 가중치 0 → G1~G5에 재분배
+    g6_active = any(col_weights.get(col, 0.0) > 0 for col, _ in G6_cols)
+    if not g6_active:
+        raw_weights["G6"] = 0.0
+
     total = sum(raw_weights.values())
-    norm_weights = {g: w / total for g, w in raw_weights.items()}
+    norm_weights = {g: w / total for g, w in raw_weights.items()} if total > 0 else {g: 0.0 for g in raw_weights}
 
     return float(np.clip(sum(group_scores[g] * norm_weights[g] for g in group_scores), 0.0, 1.0))

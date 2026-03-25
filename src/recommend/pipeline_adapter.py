@@ -63,8 +63,10 @@ def build_input_data_from_user_info(user_info: Dict[str, Any]) -> Dict[str, Any]
     """
     LangGraph user_info → 파이프라인 2.9.1 input JSON 형태.
     """
-    owned = _str_list(user_info.get("owned_appliances"))
-    needed_el = _str_list(user_info.get("needed_appliances"))
+    from src.graph import _normalize_appliance_names
+
+    owned = _normalize_appliance_names(_str_list(user_info.get("owned_appliances")))
+    needed_el = _normalize_appliance_names(_str_list(user_info.get("needed_appliances")))
     furniture_needed = _str_list(user_info.get("furniture_needed"))
     if not furniture_needed:
         furniture_needed = _str_list(user_info.get("purchase_plans"))
