@@ -1000,10 +1000,16 @@ def _format_furniture(p: dict) -> dict:
     }
 
 
-def format_output(themed_packages: list, reasons: list) -> dict:
+def format_output(
+    themed_packages: list,
+    reasons: list,
+    needed_categories: set = None,
+    budget: int = 0,
+) -> dict:
     """
     테마별 패키지 + 추천 이유 → 프론트 요청 형태로 변환
     """
+    needed_categories = needed_categories or set()
     output_packages = []
 
     for item, reason in zip(themed_packages, reasons):
@@ -1019,11 +1025,33 @@ def format_output(themed_packages: list, reasons: list) -> dict:
             else:
                 furniture.append(_format_furniture(p))
 
+        # ── recommendationPlus 생성 ──
+        plus_parts = []
+
+        # 1. 구독 추천 안내: 패키지 내 구독 제품이 절반 이상이면
+        if budget > 0 and appliances:
+            sub_count = sum(1 for a in appliances if a.get("subscriptionPrice", 0) > 0)
+            if sub_count >= len(appliances) * 0.5:
+                plus_parts.append(
+                    "예산 대비 필요한 가전이 많아 구독 상품을 중심으로 추천했어요. "
+                    "월 구독으로 부담 없이 시작할 수 있어요."
+                )
+
+        # 2. 누락 카테고리 안내
+        pkg_cats = {a.get("category", "") for a in appliances} | {f.get("category", "") for f in furniture}
+        missing = needed_categories - pkg_cats - {""}
+        if missing:
+            missing_str = ", ".join(sorted(missing))
+            plus_parts.append(
+                f"{missing_str}은(는) 예산 내 적합한 제품을 찾지 못해 이 패키지에 포함되지 않았어요."
+            )
+
         output_packages.append({
             "theme":                theme,
             "appliances":           appliances,
             "furniture":            furniture,
             "recommendationReason": reason,
+            "recommendationPlus":   " ".join(plus_parts) if plus_parts else None,
         })
 
     return {"packages": output_packages}
@@ -1040,6 +1068,7 @@ def run_scoring(
     preferences: list = None,
     square_footage: int = 0,
     use_llm: bool = True,
+    needed_categories: list = None,
 ) -> dict:
     """
     멀티 전략 앙상블 + 탐욕 다양성 구성.
@@ -1090,5 +1119,6 @@ def run_scoring(
     else:
         reasons = ["test"] * len(themed_packages)
 
-    # 5. 출력 포맷
-    return format_output(themed_packages, reasons)
+    # 6. 출력 포맷
+    all_needed = set(needed_categories or list(results.keys()))
+    return format_output(themed_packages, reasons, all_needed, budget)

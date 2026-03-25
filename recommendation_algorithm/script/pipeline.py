@@ -167,11 +167,12 @@ def run_full_pipeline(input_data: dict, engine, use_llm: bool = True) -> dict:
     results = run_pipeline(input_data, engine)
     output = run_scoring(
         results,
-        budget         = p["budget"],
-        starter        = p["starter"],
-        preferences    = p["preferences"],
-        square_footage = p["square_footage"] or 0,
-        use_llm        = use_llm,
+        budget             = p["budget"],
+        starter            = p["starter"],
+        preferences        = p["preferences"],
+        square_footage     = p["square_footage"] or 0,
+        use_llm            = use_llm,
+        needed_categories  = p["needed_electronics"] + p["needed_furniture"],
     )
     print(f"  [pipeline] 전체 run_full_pipeline: {time.time()-t_full:.3f}s")
     return output
