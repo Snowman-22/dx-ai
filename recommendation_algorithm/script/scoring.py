@@ -169,49 +169,119 @@ def _get_theme_candidates(reranked: dict, theme: str) -> dict:
     return candidates
 
 
-def _greedy_pick_packages(
+def _package_feature_vector(pkg: dict) -> np.ndarray:
+    """
+    패키지의 특성 벡터 생성 (MMR 유사도 계산용).
+    제품별 특성을 평균하여 패키지 수준 벡터로 집약.
+    """
+    products = pkg.get("products", [])
+    if not products:
+        return np.zeros(8)
+
+    score_col = "final_score" if "final_score" in products[0] else "derived_score"
+    n = len(products)
+
+    # 8차원 특성 벡터
+    avg_score = np.mean([p.get(score_col, 0.0) for p in products])
+    avg_price = np.mean([p.get("price", 0) for p in products]) / 5_000_000  # 정규화
+    sub_ratio = sum(1 for p in products if p.get("is_subscribe")) / n
+    ai_ratio = sum(1 for p in products if p.get("has_ai")) / n
+    energy_ratio = sum(1 for p in products if p.get("energy_grade") in ("1등급", "2등급")) / n
+    premium_ratio = sum(1 for p in products
+                        if p.get("premium_line") in ("오브제", "시그니처")
+                        or p.get("material_grade") == "프리미엄") / n
+    pet_avg = np.mean([float(p.get("pet_score", 0) or 0) for p in products]) / 5.0
+    small_ratio = sum(1 for p in products if p.get("size_grade") == "소") / n
+
+    return np.array([avg_score, avg_price, sub_ratio, ai_ratio,
+                     energy_ratio, premium_ratio, pet_avg, small_ratio])
+
+
+MMR_LAMBDA = 0.6  # 점수 60% + 다양성 40%
+
+
+def _mmr_pick_packages(
     packages: list,
     n: int,
     existing_themed: list,
-    global_product_keys: set,
 ) -> list:
-    """탐욕적으로 n개 패키지 선택, 기존 패키지와 다양성 유지"""
-    selected = []
-    local_keys = set()
+    """
+    MMR(Maximum Marginal Relevance) 기반 패키지 선택.
+    score = λ × relevance - (1-λ) × max_similarity(기존 선택과의 유사도)
+    """
+    if not packages:
+        return []
 
+    # 시그니처 중복 제거 (동일 조합 제외)
+    existing_sigs = {_package_signature(tp["package"]) for tp in existing_themed}
+    candidates = []
     for pkg in packages:
-        if len(selected) >= n:
+        sig = _package_signature(pkg)
+        if sig not in existing_sigs:
+            candidates.append(pkg)
+
+    if not candidates:
+        return []
+
+    # 특성 벡터 + 점수 사전 계산
+    vectors = [_package_feature_vector(pkg) for pkg in candidates]
+    scores = np.array([pkg.get("theme_score", pkg.get("package_score", 0.0))
+                       for pkg in candidates])
+
+    # 점수 정규화 (0~1)
+    s_min, s_max = scores.min(), scores.max()
+    if s_max > s_min:
+        norm_scores = (scores - s_min) / (s_max - s_min)
+    else:
+        norm_scores = np.ones(len(scores))
+
+    # 기존 테마에서 선택된 패키지의 벡터 (크로스 테마 다양성)
+    existing_vectors = [_package_feature_vector(tp["package"]) for tp in existing_themed]
+
+    selected = []
+    selected_vectors = list(existing_vectors)  # 기존 + 신규 모두 포함
+    used_indices = set()
+
+    for _ in range(n):
+        best_idx = -1
+        best_mmr = -float("inf")
+
+        for i, pkg in enumerate(candidates):
+            if i in used_indices:
+                continue
+
+            relevance = norm_scores[i]
+
+            # 기존 선택과의 최대 유사도
+            if selected_vectors:
+                sims = []
+                vec_i = vectors[i]
+                norm_i = np.linalg.norm(vec_i)
+                if norm_i == 0:
+                    max_sim = 0.0
+                else:
+                    for sv in selected_vectors:
+                        norm_sv = np.linalg.norm(sv)
+                        if norm_sv == 0:
+                            sims.append(0.0)
+                        else:
+                            sims.append(float(np.dot(vec_i, sv) / (norm_i * norm_sv)))
+                    max_sim = max(sims)
+            else:
+                max_sim = 0.0
+
+            mmr = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * max_sim
+
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_idx = i
+
+        if best_idx < 0:
             break
 
-        keys = _package_product_keys(pkg)
-        if not keys:
-            continue
-
-        # 시그니처 중복 체크 (동일 조합 방지)
-        sig = _package_signature(pkg)
-        if any(_package_signature(tp["package"]) == sig for tp in existing_themed):
-            continue
-
-        # 같은 테마 내 다양성: 기존 선택과 30% 이상 새 제품
-        if local_keys:
-            new_ratio = len(keys - local_keys) / len(keys)
-            if new_ratio < 0.3:
-                continue
-
-        selected.append(pkg)
-        local_keys |= keys
-
-    # 부족하면 다양성 완화해서 채움
-    if len(selected) < n:
-        for pkg in packages:
-            if len(selected) >= n:
-                break
-            sig = _package_signature(pkg)
-            if any(_package_signature(s) == sig for s in selected):
-                continue
-            if any(_package_signature(tp["package"]) == sig for tp in existing_themed):
-                continue
-            selected.append(pkg)
+        selected.append(candidates[best_idx])
+        selected_vectors.append(vectors[best_idx])
+        used_indices.add(best_idx)
 
     return selected
 
@@ -944,9 +1014,8 @@ def run_scoring(
     # 2. 테마 결정
     themes = _determine_themes(preferences)
 
-    # 3. 멀티 전략 앙상블 + 탐욕 다양성 구성
+    # 3. 멀티 전략 앙상블 + MMR 다양성 선택
     themed_packages = []
-    global_product_keys = set()
 
     for theme in themes:
         # 테마별 후보 선정 (다른 정렬 기준)
@@ -965,12 +1034,9 @@ def run_scoring(
         packages.sort(key=lambda p: p["theme_score"], reverse=True)
 
         # 탐욕적으로 4개 선택
-        picked = _greedy_pick_packages(
-            packages, N_PER_THEME, themed_packages, global_product_keys,
-        )
+        picked = _mmr_pick_packages(packages, N_PER_THEME, themed_packages)
         for pkg in picked:
             themed_packages.append({"theme": theme, "package": pkg})
-            global_product_keys |= _package_product_keys(pkg)
 
     # 4. 최소 12개 보장 — 부족하면 밸런스 풀에서 추가
     if len(themed_packages) < MIN_PACKAGES:
