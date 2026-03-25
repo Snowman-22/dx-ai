@@ -18,15 +18,18 @@ from typing import Optional
 
 # ── 설정 ────────────────────────────────────────────────────────────
 
-TOP_N_PER_CATEGORY  = 5    # 카테고리별 상위 N개 후보
+TOP_N_PER_CATEGORY  = 7    # 카테고리별 상위 N개 후보
 N_PACKAGES          = 60   # 전체 조합 풀 크기
 N_THEMES            = 3    # 테마 수
 N_PER_THEME         = 4    # 테마별 패키지 수
 N_DISPLAY           = N_THEMES  # _determine_themes용
-MIN_PACKAGES        = 3    # 최종 최소 패키지 수
+MIN_PACKAGES        = 12   # 최종 최소 패키지 수 (3테마 × 4개)
 MIN_PRODUCTS_PER_PACKAGE = 3  # 패키지당 최소 상품 수
 DIVERSITY_PENALTY   = 1.0   # 이미 등장한 제품 1개당 패널티
 MIN_DIFF_RATIO      = 0.3    # 패키지 간 최소 30% 제품이 달라야 함
+MAX_PER_BRAND       = 2    # 카테고리당 같은 브랜드 최대 후보 수
+ELEC_WEIGHT         = 1.3  # 패키지 점수 계산 시 가전 가중치
+FURN_WEIGHT         = 0.8  # 패키지 점수 계산 시 가구 가중치
 
 
 # ================================================================== #
@@ -84,23 +87,43 @@ def rerank(results: dict) -> dict:
 # ================================================================== #
 
 def _get_candidates(results: dict) -> dict:
-    """카테고리별 상위 TOP_N_PER_CATEGORY개 후보 추출"""
-    return {
-        cat: df.head(TOP_N_PER_CATEGORY).to_dict("records")
-        for cat, df in results.items()
-        if not df.empty
-    }
+    """카테고리별 상위 TOP_N_PER_CATEGORY개 후보 추출 (브랜드 다양성 적용)"""
+    candidates = {}
+    for cat, df in results.items():
+        if df.empty:
+            continue
+        # 브랜드가 2개 이상일 때만 다양성 제한 적용
+        unique_brands = df["brand"].dropna().nunique() if "brand" in df.columns else 0
+        apply_brand_limit = unique_brands >= 2
+
+        selected = []
+        brand_count = {}
+        for _, row in df.iterrows():
+            if len(selected) >= TOP_N_PER_CATEGORY:
+                break
+            brand = str(row.get("brand", "") or "").strip()
+            if apply_brand_limit and brand and brand_count.get(brand, 0) >= MAX_PER_BRAND:
+                continue
+            selected.append(row.to_dict())
+            if brand:
+                brand_count[brand] = brand_count.get(brand, 0) + 1
+        candidates[cat] = selected
+    return candidates
 
 
 def _calc_package_score(products: list, budget: int) -> float:
     """
-    PackageScore = 0.8 * 상품점수평균 + 0.2 * budget_fit
-    budget_fit   = 1 - abs(총조합가격 - 총예산) / 총예산
+    PackageScore = 0.8 * 가중평균점수 + 0.2 * budget_fit
+    가전 제품에 ELEC_WEIGHT, 가구에 FURN_WEIGHT 가중
     """
     score_col  = "final_score" if "final_score" in products[0] else "derived_score"
-    n = len(products)
-    score_sum = sum(p.get(score_col, 0.0) for p in products)
-    avg_score = score_sum / n if n > 0 else 0.0
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for p in products:
+        w = ELEC_WEIGHT if p.get("category", "") in ELECTRONICS_CATEGORIES else FURN_WEIGHT
+        weighted_sum += p.get(score_col, 0.0) * w
+        weight_sum += w
+    avg_score = weighted_sum / weight_sum if weight_sum > 0 else 0.0
 
     total_price = sum(p.get("price", 0) for p in products)
     if budget > 0:
@@ -129,14 +152,15 @@ def generate_packages(results: dict, budget: int) -> list:
     n_categories    = len(candidate_lists)
 
     # 카테고리 수에 따라 적응형 다양성 제약
+    # 12개 패키지 기준 최대 등장 횟수를 강하게 제한
     if n_categories <= 6:
         MAX_PRODUCT_APPEARANCES = 2
         adaptive_diff_ratio = MIN_DIFF_RATIO          # 0.3
     elif n_categories <= 9:
-        MAX_PRODUCT_APPEARANCES = 3
+        MAX_PRODUCT_APPEARANCES = 2
         adaptive_diff_ratio = 0.25
     else:
-        MAX_PRODUCT_APPEARANCES = 4
+        MAX_PRODUCT_APPEARANCES = 2
         adaptive_diff_ratio = 0.2
 
     # 총 조합 수 계산, 너무 많으면 카테고리당 후보 수를 줄임
@@ -176,15 +200,21 @@ def generate_packages(results: dict, budget: int) -> list:
     # 각 grid를 flatten → (total_combos,) 배열
     idx_arrays = [g.ravel() for g in grids]
 
+    # ── 가전/가구 가중치 배열 ────────────────────────────────────
+    cat_weights = np.array([
+        ELEC_WEIGHT if cat in ELECTRONICS_CATEGORIES else FURN_WEIGHT
+        for cat in categories
+    ])
+
     # ── 벡터화 점수/가격 계산 ────────────────────────────────────
     score_sum = np.zeros(total_combos)
     price_sum = np.zeros(total_combos, dtype=np.int64)
 
     for cat_i in range(n_categories):
-        score_sum += cat_scores[cat_i][idx_arrays[cat_i]]
+        score_sum += cat_scores[cat_i][idx_arrays[cat_i]] * cat_weights[cat_i]
         price_sum += cat_prices[cat_i][idx_arrays[cat_i]]
 
-    avg_scores = score_sum / n_categories
+    avg_scores = score_sum / cat_weights.sum()
 
     if budget > 0:
         budget_fits = np.maximum(0.0, 1.0 - np.abs(price_sum - budget) / budget)
@@ -469,6 +499,7 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
         adjusted.append({"theme": theme, "package": fixed_pkg})
 
     if len(adjusted) < MIN_PACKAGES:
+        # 1차: 중복 시그니처 제외하고 채움
         for pkg in all_packages:
             if len(adjusted) >= MIN_PACKAGES:
                 break
@@ -480,6 +511,16 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
                 continue
             if sig:
                 seen_sig.add(sig)
+            adjusted.append({"theme": "밸런스", "package": fixed_pkg})
+
+    if len(adjusted) < MIN_PACKAGES:
+        # 2차: 시그니처 중복도 허용하고 채움
+        for pkg in all_packages:
+            if len(adjusted) >= MIN_PACKAGES:
+                break
+            if not isinstance(pkg, dict):
+                continue
+            fixed_pkg = _ensure_min_products(pkg, global_pool, MIN_PRODUCTS_PER_PACKAGE)
             adjusted.append({"theme": "밸런스", "package": fixed_pkg})
 
     return adjusted
@@ -497,6 +538,10 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
     themes    = _determine_themes(preferences)
     selected  = []
     remaining = list(range(len(all_packages)))  # 아직 선택 안 된 조합 인덱스
+
+    # 전역 제품 등장 횟수 추적 → 반복 등장 시 점수 페널티
+    global_pid_counts = {}
+    REPEAT_PENALTY = 0.15  # 이미 등장한 제품 1회당 페널티
 
     # 카테고리 수 파악 (적응형 다양성 비율 결정)
     sample_n = len(all_packages[0].get("products", [])) if all_packages else 0
@@ -525,10 +570,30 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
                 furn_keys.add(k)
         return elec_keys, furn_keys
 
+    def _global_repeat_penalty(pkg):
+        """패키지 내 제품의 전역 반복 등장에 대한 페널티 합산"""
+        penalty = 0.0
+        for p in pkg.get("products", []):
+            if not isinstance(p, dict):
+                continue
+            k = _product_identity_key(p)
+            if k:
+                penalty += global_pid_counts.get(k, 0) * REPEAT_PENALTY
+        return penalty
+
+    def _update_global_counts(pkg):
+        """패키지 선택 후 전역 등장 횟수 갱신"""
+        for p in pkg.get("products", []):
+            if not isinstance(p, dict):
+                continue
+            k = _product_identity_key(p)
+            if k:
+                global_pid_counts[k] = global_pid_counts.get(k, 0) + 1
+
     for theme in themes:
         scored = sorted(
             [
-                (i, _score_by_theme(all_packages[i], theme, budget))
+                (i, _score_by_theme(all_packages[i], theme, budget) - _global_repeat_penalty(all_packages[i]))
                 for i in remaining
             ],
             key=lambda x: x[1],
@@ -540,7 +605,7 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
         theme_elec_sets = []  # 테마 내 가전 다양성 검증용
         theme_furn_sets = []  # 테마 내 가구 다양성 검증용
 
-        # 1차: 가전/가구 각 그룹별 다양성 기준으로 선택
+        # 1차: 가전/가구 각 그룹별 다양성 기준 (전역 페널티는 scored에 반영됨)
         for i, _ in scored:
             if picked_in_theme >= N_PER_THEME:
                 break
@@ -563,6 +628,7 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
             picked_indices.append(i)
             theme_elec_sets.append(cur_elec)
             theme_furn_sets.append(cur_furn)
+            _update_global_counts(all_packages[i])
             picked_in_theme += 1
 
         # 2차: 부족하면 가전/가구 각각 최소 1개 차이로 완화
@@ -591,6 +657,18 @@ def select_themed_packages(all_packages: list, preferences: list, budget: int) -
                 picked_indices.append(i)
                 theme_elec_sets.append(cur_elec)
                 theme_furn_sets.append(cur_furn)
+                _update_global_counts(all_packages[i])
+                picked_in_theme += 1
+
+        # 3차: 다양성 해제, 점수순으로 채움 (페널티 반영된 순서)
+        if picked_in_theme < N_PER_THEME:
+            for i, _ in scored:
+                if picked_in_theme >= N_PER_THEME:
+                    break
+                if i in picked_indices:
+                    continue
+                selected.append({"theme": theme, "package": all_packages[i]})
+                picked_indices.append(i)
                 picked_in_theme += 1
 
         # 선택된 조합을 풀에서 제거
