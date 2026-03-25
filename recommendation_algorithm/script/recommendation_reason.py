@@ -151,6 +151,7 @@ def _call_openai(client, packages_context, starter, preferences, budget, square_
             ],
             response_format={"type": "json_object"},
             temperature=0.7,
+            timeout=30,
         )
         result  = json.loads(response.choices[0].message.content)
         reasons = result.get("reasons", [])
@@ -164,6 +165,9 @@ def _call_openai(client, packages_context, starter, preferences, budget, square_
         return ["고객님의 라이프스타일에 맞게 선별된 패키지입니다."] * len(packages_context)
 
 
+BATCH_SIZE = 6  # 패키지가 많으면 6개씩 분할 호출 (토큰 절약 + 속도)
+
+
 def generate_reasons(
     packages: list,
     starter: str,
@@ -173,8 +177,7 @@ def generate_reasons(
     themes: list = None,
 ) -> list:
     """
-    12개 패키지 추천 이유를 1회 API 호출로 일괄 생성.
-    테마 정보는 각 패키지 컨텍스트에 포함하여 LLM이 참고하도록 함.
+    패키지 추천 이유 생성. 6개 이하면 1회, 초과하면 분할 호출.
     반환: ["이유1", "이유2", ...]  (packages 순서와 동일)
     """
     if not OPENAI_API_KEY:
@@ -189,4 +192,13 @@ def generate_reasons(
         ctx["테마"] = themes[i] if themes and i < len(themes) else "밸런스"
         packages_context.append(ctx)
 
-    return _call_openai(client, packages_context, starter, preferences, budget, square_footage)
+    # 6개 이하면 1회 호출, 초과하면 분할
+    if len(packages_context) <= BATCH_SIZE:
+        return _call_openai(client, packages_context, starter, preferences, budget, square_footage)
+
+    all_reasons = []
+    for start in range(0, len(packages_context), BATCH_SIZE):
+        batch = packages_context[start:start + BATCH_SIZE]
+        batch_reasons = _call_openai(client, batch, starter, preferences, budget, square_footage)
+        all_reasons.extend(batch_reasons)
+    return all_reasons
