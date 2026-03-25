@@ -166,52 +166,23 @@ def generate_reasons(
     themes: list = None,
 ) -> list:
     """
-    테마별로 API를 분리 호출해서 추천 이유 생성
-    테마가 있으면 테마별로 그룹핑 후 각각 호출 (총 테마 수만큼 API 호출)
+    12개 패키지 추천 이유를 1회 API 호출로 일괄 생성.
+    테마 정보는 각 패키지 컨텍스트에 포함하여 LLM이 참고하도록 함.
     반환: ["이유1", "이유2", ...]  (packages 순서와 동일)
     """
-    from collections import defaultdict
-
     if not OPENAI_API_KEY:
         raise RuntimeError(
             "OPENAI_API_KEY 환경 변수가 없습니다. .env 또는 실행 환경에 설정하세요."
         )
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    if not themes:
-        # 테마 없으면 전체 한 번에 호출
-        packages_context = [
-            _build_package_context(pkg, i, budget)
-            for i, pkg in enumerate(packages)
-        ]
-        return _call_openai(client, packages_context, starter, preferences, budget, square_footage)
+    packages_context = []
+    for i, pkg in enumerate(packages):
+        ctx = _build_package_context(pkg, i, budget)
+        if themes and i < len(themes):
+            ctx["테마"] = themes[i]
+        packages_context.append(ctx)
 
-    # 테마별로 그룹핑 {theme: [(원래 index, pkg), ...]}
-    theme_groups = defaultdict(list)
-    for i, (pkg, theme) in enumerate(zip(packages, themes)):
-        theme_groups[theme].append((i, pkg))
-
-    # 결과 저장 (원래 순서 유지)
-    reasons = [""] * len(packages)
-
-    for theme, group in theme_groups.items():
-        indices = [idx for idx, _ in group]
-        pkgs    = [pkg for _, pkg in group]
-
-        # 패키지 컨텍스트 생성 (테마 포함)
-        packages_context = []
-        for j, pkg in enumerate(pkgs):
-            ctx = _build_package_context(pkg, j, budget)
-            ctx["테마"] = theme
-            packages_context.append(ctx)
-
-        # 테마별 API 호출 (4개씩)
-        group_reasons = _call_openai(
-            client, packages_context, starter, preferences, budget, square_footage
-        )
-
-        # 원래 인덱스에 맞게 삽입
-        for idx, reason in zip(indices, group_reasons):
-            reasons[idx] = reason
+    return _call_openai(client, packages_context, starter, preferences, budget, square_footage)
 
     return reasons

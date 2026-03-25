@@ -111,10 +111,19 @@ def _get_candidates(results: dict) -> dict:
     return candidates
 
 
+def _effective_price(p: dict) -> int:
+    """구독 추천 제품은 구독 총비용, 일반 제품은 할인가 반환"""
+    if p.get("subscribe_recommended") and p.get("subscription_price"):
+        years = p.get("contract_period_year") or 3
+        return int(p["subscription_price"]) * int(years) * 12
+    return int(p.get("price", 0))
+
+
 def _calc_package_score(products: list, budget: int) -> float:
     """
     PackageScore = 0.8 * 가중평균점수 + 0.2 * budget_fit
     가전 제품에 ELEC_WEIGHT, 가구에 FURN_WEIGHT 가중
+    구독 추천 제품은 구독 총비용으로 budget_fit 계산
     """
     score_col  = "final_score" if "final_score" in products[0] else "derived_score"
     weighted_sum = 0.0
@@ -125,7 +134,7 @@ def _calc_package_score(products: list, budget: int) -> float:
         weight_sum += w
     avg_score = weighted_sum / weight_sum if weight_sum > 0 else 0.0
 
-    total_price = sum(p.get("price", 0) for p in products)
+    total_price = sum(_effective_price(p) for p in products)
     if budget > 0:
         budget_fit = max(0.0, 1.0 - abs(total_price - budget) / budget)
     else:
@@ -192,7 +201,7 @@ def generate_packages(results: dict, budget: int) -> list:
     cat_prices = []
     for cl in effective_lists:
         cat_scores.append(np.array([p.get(score_col, 0.0) for p in cl]))
-        cat_prices.append(np.array([p.get("price", 0) for p in cl]))
+        cat_prices.append(np.array([_effective_price(p) for p in cl]))
 
     # ── numpy meshgrid로 모든 조합의 인덱스 생성 ────────────────
     ranges = [np.arange(len(cl)) for cl in effective_lists]
@@ -386,27 +395,47 @@ def _determine_themes(preferences: list) -> list:
 
 
 def _score_by_theme(pkg: dict, theme: str, budget: int) -> float:
-    """테마별 패키지 점수 계산"""
+    """테마별 패키지 점수 계산 (복합 지표)"""
     products    = pkg["products"]
     total_price = pkg["total_price"]
+    n           = len(products) if products else 1
     score_col   = "final_score" if "final_score" in products[0] else "derived_score"
+    avg_score   = float(np.mean([p.get(score_col, 0.0) for p in products]))
 
     if theme == "가성비":
-        return 1.0 - (total_price / budget) if budget > 0 else 0.0
+        # 가격 저렴함 50% + 가성비 점수(value_score) 50%
+        price_ratio = 1.0 - (total_price / budget) if budget > 0 else 0.0
+        value_avg = float(np.mean([p.get("value_score", 5.0) or 5.0 for p in products])) / 10.0
+        return 0.5 * max(0.0, price_ratio) + 0.5 * value_avg
     elif theme == "프리미엄":
-        return float(np.mean([p.get(score_col, 0.0) for p in products]))
+        # 상품 점수 50% + 프리미엄 속성 50%
+        premium_cnt = sum(1 for p in products
+                         if p.get("premium_line") in ("오브제", "시그니처")
+                         or p.get("material_grade") == "프리미엄")
+        premium_ratio = premium_cnt / n
+        return 0.5 * avg_score + 0.5 * premium_ratio
     elif theme == "효율":
         has_subscribe   = any(p.get("is_subscribe") for p in products)
-        subscribe_bonus = 0.2 if has_subscribe else 0.0
-        return pkg["package_score"] + subscribe_bonus
+        subscribe_bonus = 0.15 if has_subscribe else 0.0
+        energy_cnt = sum(1 for p in products if p.get("energy_grade") in ("1등급", "2등급"))
+        energy_ratio = energy_cnt / n
+        return 0.5 * pkg["package_score"] + 0.3 * energy_ratio + 0.2 * subscribe_bonus
     elif theme == "펫 프렌들리":
-        return float(sum(p.get("pet_score", 0) or 0 for p in products))
+        # 가전 pet_score + 가구 pet_score 통합 (0~1 정규화)
+        pet_scores = [float(p.get("pet_score", 0) or 0) for p in products]
+        max_pet = 5.0
+        pet_avg = float(np.mean(pet_scores)) / max_pet if pet_scores else 0.0
+        return 0.6 * pet_avg + 0.4 * avg_score
     elif theme == "공간 최적화":
         small_cnt = sum(1 for p in products if p.get("size_grade") == "소")
-        return small_cnt / len(products) if products else 0.0
+        space_scores = [float(p.get("space_saving_score", 0) or 0) for p in products]
+        space_avg = float(np.mean(space_scores)) / 5.0 if space_scores else 0.0
+        small_ratio = small_cnt / n
+        return 0.4 * small_ratio + 0.3 * space_avg + 0.3 * avg_score
     elif theme == "친환경":
         eco_cnt = sum(1 for p in products if p.get("is_eco_friendly"))
-        return eco_cnt / len(products) if products else 0.0
+        eco_ratio = eco_cnt / n
+        return 0.5 * eco_ratio + 0.5 * avg_score
     else:  # 밸런스
         return pkg.get("adjusted_score", pkg["package_score"])
 
@@ -461,16 +490,21 @@ def _ensure_min_products(pkg: dict, global_pool: list, min_count: int) -> dict:
     out      = dict(pkg)
     products = list(out.get("products") or [])
     used     = {_product_identity_key(p) for p in products if isinstance(p, dict)}
+    used_cats = {p.get("category", "") for p in products if isinstance(p, dict)}
 
     if len(products) < min_count:
         for gp in global_pool:
             if not isinstance(gp, dict):
                 continue
             k = _product_identity_key(gp)
+            cat = gp.get("category", "")
             if not k or k in used:
+                continue
+            if cat and cat in used_cats:
                 continue
             products.append(gp)
             used.add(k)
+            used_cats.add(cat)
             if len(products) >= min_count:
                 break
 
