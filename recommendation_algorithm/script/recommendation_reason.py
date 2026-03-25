@@ -99,12 +99,19 @@ def _build_prompt(
 
 작성 조건:
 - 각 패키지마다 2~3문장으로 작성
+- 각 패키지에는 반드시 "테마" 필드가 포함되어 있습니다. 해당 테마의 핵심 가치를 추천 이유의 중심으로 삼아 작성하세요:
+  · 가성비: 합리적인 가격, 할인율, 가격 대비 성능을 강조
+  · 프리미엄: 고급 소재, 오브제/시그니처 라인, 디자인 완성도를 강조
+  · 효율: 에너지 등급, 구독 혜택, AI/자동화 기능의 편리함을 강조
+  · 펫 프렌들리: 반려동물 친화 기능, 털 관리, 청소 편의성을 강조
+  · 공간 최적화: 컴팩트한 크기, 공간 절약, 소형 주거에 적합함을 강조
+  · 친환경: 친환경 소재, 에너지 절약, 안전한 성분을 강조
+  · 밸런스: 가격·품질·기능의 균형 잡힌 구성을 강조
 - 사용자의 선호 조건과 연결해서 설명
 - 가격, 할인, 구독, AI 기능, 에너지 등급, 소재, 디자인 등 제품 정보를 구체적으로 활용
 - 친근하고 자연스러운 한국어 톤
 - 각 패키지는 독립적으로 작성 (다른 패키지와 비교하거나 언급하지 말 것)
 - "패키지 N은", "패키지 N의" 같은 패키지 번호 표현 사용 금지
-- 패키지에 "테마" 필드가 있으면 해당 테마(예: 가성비, 프리미엄, 효율 등)의 관점을 추천 이유에 자연스럽게 반영할 것
 - 반드시 아래 JSON 형식으로만 응답 (다른 텍스트 없이)
 
 응답 형식:
@@ -179,8 +186,7 @@ def generate_reasons(
     packages_context = []
     for i, pkg in enumerate(packages):
         ctx = _build_package_context(pkg, i, budget)
-        if themes and i < len(themes):
-            ctx["테마"] = themes[i]
+        ctx["테마"] = themes[i] if themes and i < len(themes) else "밸런스"
         packages_context.append(ctx)
 
     return _call_openai(client, packages_context, starter, preferences, budget, square_footage)
