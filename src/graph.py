@@ -1412,6 +1412,10 @@ def _find_model_ids_by_product_name(
                 candidates.append((sc, pi, mid, pname))
 
     if not candidates:
+        logger.info(
+            "RECOMMEND_RAG product-name fallback: no candidate for question=%r",
+            question,
+        )
         return [], None
 
     candidates.sort(key=lambda x: -x[0])
@@ -1429,6 +1433,13 @@ def _find_model_ids_by_product_name(
                 first_pkg = pi
             if len(out_ids) >= max_models:
                 break
+    logger.info(
+        "RECOMMEND_RAG product-name fallback: question=%r selected_model_ids=%s pkg_idx=%s top_candidates=%s",
+        question,
+        out_ids,
+        first_pkg,
+        candidates[:5],
+    )
 
     return out_ids, first_pkg
 
@@ -1438,9 +1449,17 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
     user_info = state.get("user_info") or {}
     raw_user = state.get("last_user_input") or ""
     question_str, explicit_pkg_idx = _parse_recommend_rag_user_input(raw_user)
+    logger.info(
+        "RECOMMEND_RAG start: raw_user=%r parsed_question=%r explicit_pkg_idx=%s selected_pkg_idx=%s",
+        raw_user,
+        question_str,
+        explicit_pkg_idx,
+        (state.get("user_info") or {}).get("selected_package_index"),
+    )
     messages = _append_message(state, role="user", content=raw_user)
     new_data = dict(state.get("data") or {})
     want_review = _want_review_intent(question_str)
+    logger.info("RECOMMEND_RAG intent: question=%r want_review=%s", question_str, want_review)
 
     def _extract_package_index(text: str) -> Optional[int]:
         m = re.search(r"(\d+)\s*번", text)
@@ -1460,6 +1479,7 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             package_idx = int(user_info["selected_package_index"])
         except (TypeError, ValueError):
             package_idx = None
+    logger.info("RECOMMEND_RAG resolved package_idx=%s question=%r", package_idx, question_str)
 
     prompt = None
     if package_idx is not None and not want_review:
@@ -1475,6 +1495,12 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                             mid = p.get("model_id")
                             if mid: model_ids.append(str(mid))
                 if model_ids:
+                    logger.info(
+                        "RECOMMEND_RAG package-context path: package_idx=%s model_ids=%s question=%r",
+                        package_idx,
+                        model_ids,
+                        question_str,
+                    )
                     try:
                         session_maker = get_session_maker()
                         async with session_maker() as session:
@@ -1495,7 +1521,17 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                             question_str,
                             package_context=package_context,
                         )
+                        logger.info(
+                            "RECOMMEND_RAG package-context path success: package_idx=%s fetched_products=%s",
+                            package_idx,
+                            len(details.get("products") or []),
+                        )
                     except Exception:
+                        logger.exception(
+                            "RECOMMEND_RAG package-context path failed: package_idx=%s question=%r",
+                            package_idx,
+                            question_str,
+                        )
                         prompt = None
 
     # 추천 리스트가 있을 때 '같은 가격대'·'다른 가전' 등 follow-up 의도면,
@@ -1509,6 +1545,12 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         and not want_review
         and _fu_early.kind != FollowupRecommendKind.NONE
         and not _detect_next_recommendation_page_intent(_to_str(question_str))
+    )
+    logger.info(
+        "RECOMMEND_RAG early-search guard: has_recs=%s followup_kind=%s skip_early_catalog_name_search=%s",
+        _has_recs_fu,
+        _fu_early.kind,
+        skip_early_catalog_name_search,
     )
 
     # 사용자 상품명(자유 텍스트) → product 테이블 ILIKE (카탈로그 우선)
@@ -1525,6 +1567,19 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             async with session_maker() as session:
                 details = await search_products_by_name_query(session, query=question_str)
             if (details.get("products") or []):
+                logger.info(
+                    "RECOMMEND_RAG direct DB name search success: question=%r products=%s",
+                    question_str,
+                    [
+                        {
+                            "model_id": item.get("model_id"),
+                            "product_id": (item.get("product") or {}).get("product_id"),
+                            "product_name": (item.get("product") or {}).get("product_name"),
+                            "spec": item.get("spec"),
+                        }
+                        for item in (details.get("products") or [])
+                    ],
+                )
                 package_context = {
                     "package_index": None,
                     "matched_by": "db_product_name_search",
@@ -1536,7 +1591,16 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                     question_str,
                     package_context=package_context,
                 )
+            else:
+                logger.info(
+                    "RECOMMEND_RAG direct DB name search empty: question=%r",
+                    question_str,
+                )
         except Exception:
+            logger.exception(
+                "RECOMMEND_RAG direct DB name search failed: question=%r",
+                question_str,
+            )
             prompt = None
 
     # 패키지 인덱스 없이 질문에 상품명이 있으면 recommendation_list에서 매칭 → DB 스펙
@@ -1544,6 +1608,12 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         all_recs = new_data.get("recommendation_list") or []
         mids_name, pkg_by_name = _find_model_ids_by_product_name(question_str, all_recs)
         if mids_name:
+            logger.info(
+                "RECOMMEND_RAG recommendation-list fallback: question=%r model_ids=%s pkg_idx=%s",
+                question_str,
+                mids_name,
+                pkg_by_name,
+            )
             try:
                 session_maker = get_session_maker()
                 async with session_maker() as session:
@@ -1576,7 +1646,17 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                     question_str,
                     package_context=package_context,
                 )
+                logger.info(
+                    "RECOMMEND_RAG recommendation-list fallback success: question=%r fetched_products=%s",
+                    question_str,
+                    len(details.get("products") or []),
+                )
             except Exception:
+                logger.exception(
+                    "RECOMMEND_RAG recommendation-list fallback failed: question=%r model_ids=%s",
+                    question_str,
+                    mids_name,
+                )
                 prompt = None
 
     if prompt is None:
@@ -1592,6 +1672,12 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             "비슷한", "유사한", "같은류", "이런거", "이런제품", "이런종류",
             "대안", "대체", "비슷한거", "추천해줘",
         ))
+        logger.info(
+            "RECOMMEND_RAG secondary intent: question=%r want_compare=%s want_semantic=%s",
+            question_str,
+            want_compare,
+            want_semantic,
+        )
 
         # ── 추천 상품 model_id 수집 ──
         all_recs = new_data.get("recommendation_list") or []
@@ -1612,6 +1698,11 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                         rec_product_ids.append(int(pid))
                     except (TypeError, ValueError):
                         pass
+        logger.info(
+            "RECOMMEND_RAG recommendation pool: rec_model_ids=%s rec_product_ids=%s",
+            rec_model_ids,
+            rec_product_ids,
+        )
 
         # ── 키워드 추출 ──
         search_keywords: List[str] = []
@@ -1620,6 +1711,11 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                 if alias.lower() in q_str.lower():
                     search_keywords.append(canonical)
                     break
+        logger.info(
+            "RECOMMEND_RAG search keywords: question=%r keywords=%s",
+            question_str,
+            search_keywords,
+        )
 
         # ── DB 조회 (하나의 세션으로 통합) ──
         recommended_details: Dict[str, Any] = {"products": []}
@@ -1638,11 +1734,18 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             and fu_intent.kind != FollowupRecommendKind.NONE
             and not _detect_next_recommendation_page_intent(_to_str(question_str))
         )
+        logger.info(
+            "RECOMMEND_RAG followup intent: kind=%s active=%s has_recs=%s",
+            fu_intent.kind,
+            fu_active,
+            has_recs,
+        )
 
         try:
             session_maker = get_session_maker()
             async with session_maker() as session:
                 if want_review:
+                    logger.info("RECOMMEND_RAG review branch: question=%r", question_str)
                     # 리뷰: product 테이블 상품명 검색 → 그 product_id로만 product_tags 조회
                     recommended_details = {"products": []}
                     searched_details = {"products": []}
@@ -1658,21 +1761,41 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                             query=question_str,
                             include_spec_and_prices=False,
                         )
+                        logger.info(
+                            "RECOMMEND_RAG review branch: direct name search product_ids=%s",
+                            _product_ids_from_bundle(searched_details),
+                        )
                     # 상품명 매칭 실패 시에만 키워드로 보조 (가습기 등 광역 검색)
                     if not (searched_details.get("products") or []) and search_keywords:
+                        logger.info(
+                            "RECOMMEND_RAG review branch: fallback to keyword search keywords=%s",
+                            search_keywords,
+                        )
                         searched_details = await search_products_by_keywords(
                             session,
                             keywords=search_keywords,
                             limit=10,
                             include_spec_and_prices=False,
                         )
+                        logger.info(
+                            "RECOMMEND_RAG review branch: keyword search product_ids=%s",
+                            _product_ids_from_bundle(searched_details),
+                        )
 
                     all_pids = _product_ids_from_bundle(searched_details)
                     if not all_pids:
                         all_pids = list(set(rec_product_ids))
+                        logger.info(
+                            "RECOMMEND_RAG review branch: using recommendation product_ids fallback=%s",
+                            all_pids,
+                        )
                     if all_pids:
                         review_tags_data = await fetch_product_review_tags(
                             session, product_ids=all_pids
+                        )
+                        logger.info(
+                            "RECOMMEND_RAG review branch: fetched review_tags product_ids=%s",
+                            list(review_tags_data.keys()),
                         )
                 else:
                     # 1) 추천 상품 상세
@@ -1680,15 +1803,29 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                         recommended_details = await fetch_products_bundle_details(
                             session, model_ids=rec_model_ids
                         )
+                        logger.info(
+                            "RECOMMEND_RAG recommended_details fetched count=%s",
+                            len(recommended_details.get("products") or []),
+                        )
 
                     # 2) 키워드 검색
                     if search_keywords:
                         searched_details = await search_products_by_keywords(
                             session, keywords=search_keywords, limit=10
                         )
+                        logger.info(
+                            "RECOMMEND_RAG keyword search fetched count=%s product_ids=%s",
+                            len(searched_details.get("products") or []),
+                            _product_ids_from_bundle(searched_details),
+                        )
 
                     # 2b) 추천 리스트 보유 후 추가 추천 의도(다른 가전/가구, 유사, 같은 가격대 등)
                     if fu_active:
+                        logger.info(
+                            "RECOMMEND_RAG followup query start: kind=%s question=%r",
+                            fu_intent.kind,
+                            question_str,
+                        )
                         fb, sem_fu, note_fu = await run_followup_recommendation_queries(
                             session, fu_intent, question_str
                         )
@@ -1702,11 +1839,22 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                             semantic_results = sem_fu
                         if fu_intent.kind == FollowupRecommendKind.SIMILAR_PRODUCT:
                             skip_generic_semantic = True
+                        logger.info(
+                            "RECOMMEND_RAG followup query result: merged_products=%s semantic_count=%s note=%r skip_generic_semantic=%s",
+                            len((fb.get("products") or [])),
+                            len(sem_fu or []),
+                            note_fu,
+                            skip_generic_semantic,
+                        )
 
                 # 4) 상품 비교
                 if want_compare and rec_model_ids:
                     comparison_data = await fetch_products_comparison(
                         session, model_ids=rec_model_ids
+                    )
+                    logger.info(
+                        "RECOMMEND_RAG comparison fetched count=%s",
+                        len(comparison_data or []),
                     )
 
                 # 5) 시맨틱(벡터) 검색
@@ -1723,10 +1871,18 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                         semantic_results = await semantic_search_products(
                             session, query_embedding=query_vec, top_k=5
                         )
+                        logger.info(
+                            "RECOMMEND_RAG semantic search success: count=%s",
+                            len(semantic_results or []),
+                        )
                     except Exception:
+                        logger.exception(
+                            "RECOMMEND_RAG semantic search failed: question=%r",
+                            question_str,
+                        )
                         semantic_results = []
         except Exception:
-            pass
+            logger.exception("RECOMMEND_RAG integrated DB query block failed: question=%r", question_str)
 
         has_any_data = (
             recommended_details.get("products")
@@ -1738,6 +1894,15 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
         )
 
         if has_any_data:
+            logger.info(
+                "RECOMMEND_RAG db-products prompt path: question=%r recommended=%s searched=%s comparison=%s semantic=%s review_tags=%s",
+                question_str,
+                len(recommended_details.get("products") or []),
+                len(searched_details.get("products") or []),
+                len(comparison_data or []),
+                len(semantic_results or []),
+                len(review_tags_data or {}),
+            )
             # review_tags_data: {pid: [tags]} → 프롬프트용 {product_name: [tags]}
             review_tags_for_prompt: Dict[str, Any] = {}
             if review_tags_data:
@@ -1763,6 +1928,10 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                 followup_instruction=followup_instruction,
             )
         else:
+            logger.info(
+                "RECOMMEND_RAG fallback to generic prompt: question=%r",
+                question_str,
+            )
             prompt = build_rag_prompt(user_info, question_str)
 
     resp = await llm_json.ainvoke(prompt)
