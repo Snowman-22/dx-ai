@@ -299,9 +299,16 @@ def _mmr_pick_packages(
     return selected
 
 
-def _effective_price(p: dict) -> int:
-    """구독 추천 제품은 구독 총비용, 일반 제품은 할인가 반환"""
-    if p.get("subscribe_recommended") and p.get("subscription_price"):
+def _effective_price(p: dict, prefer_subscription: bool = False) -> int:
+    """
+    제품의 실효 가격 반환.
+    prefer_subscription=True: 구독 가능 제품은 구독 총비용(월×개월) 사용.
+    (예산 부족 시 자동 활성화)
+    """
+    use_sub = p.get("subscription_price") and (
+        p.get("subscribe_recommended") or prefer_subscription
+    )
+    if use_sub:
         years = p.get("contract_period_year") or 3
         return int(p["subscription_price"]) * int(years) * 12
     return int(p.get("price", 0))
@@ -405,12 +412,18 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
     first_product = effective_lists[0][0] if effective_lists[0] else {}
     score_col = "final_score" if "final_score" in first_product else "derived_score"
 
+    # ── 예산 초과 판정: 최저가 조합이 예산을 넘으면 구독 가격 모드 ──
+    min_prices = [min((p.get("price", 0) for p in cl), default=0) for cl in effective_lists]
+    prefer_subscription = budget > 0 and sum(min_prices) > budget
+    # 구독 모드 시 예산을 65%로 축소 (구독 총비용에는 서비스비/이자 포함)
+    effective_budget = int(budget * 0.65) if prefer_subscription else budget
+
     # ── 카테고리별 점수/가격 배열 준비 ───────────────────────────
     cat_scores = []  # [np.array for each category]
     cat_prices = []
     for cl in effective_lists:
         cat_scores.append(np.array([p.get(score_col, 0.0) for p in cl]))
-        cat_prices.append(np.array([_effective_price(p) for p in cl]))
+        cat_prices.append(np.array([_effective_price(p, prefer_subscription) for p in cl]))
 
     # ── numpy meshgrid로 모든 조합의 인덱스 생성 ────────────────
     ranges = [np.arange(len(cl)) for cl in effective_lists]
@@ -434,8 +447,8 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
 
     avg_scores = score_sum / cat_weights.sum()
 
-    if budget > 0:
-        budget_fits = np.maximum(0.0, 1.0 - np.abs(price_sum - budget) / budget)
+    if effective_budget > 0:
+        budget_fits = np.maximum(0.0, 1.0 - np.abs(price_sum - effective_budget) / effective_budget)
     else:
         budget_fits = np.ones(total_combos)
 
