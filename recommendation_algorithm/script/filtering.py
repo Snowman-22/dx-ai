@@ -168,9 +168,8 @@ def fetch_category_price_stats(engine) -> dict:
 
 def allocate_budget(needed_items: list, budget: int, category_price_stats: dict) -> dict:
     """
-    품목별 대표 가격 비율로 총예산을 배분
-    category_price_stats: {category: median_price}
-    반환: {category: allocated_budget}
+    품목별 대표 가격 비율로 총예산을 배분.
+    각 카테고리에 최소 대표 가격만큼은 배정하여 저가 카테고리가 탈락하지 않도록 보장.
     """
     rep_prices = {item: category_price_stats.get(item, 0) for item in needed_items}
     total_rep = sum(rep_prices.values())
@@ -179,10 +178,19 @@ def allocate_budget(needed_items: list, budget: int, category_price_stats: dict)
         per_item = budget / len(needed_items) if needed_items else 0
         return {item: per_item for item in needed_items}
 
-    return {
+    allocated = {
         item: budget * (price / total_rep)
         for item, price in rep_prices.items()
     }
+
+    # 최소 보장: 배정 예산이 대표 가격(중앙값) 미만이면 중앙값으로 올림
+    # (예산 총합이 초과될 수 있으나, filter_by_budget의 110% 여유 + 구독 폴백으로 처리)
+    for item in allocated:
+        median = rep_prices.get(item, 0)
+        if median > 0 and allocated[item] < median:
+            allocated[item] = median
+
+    return allocated
 
 
 def filter_by_budget(df: pd.DataFrame, allocated_budget: dict, price_col: str = "price") -> pd.DataFrame:
