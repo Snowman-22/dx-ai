@@ -139,7 +139,6 @@ async def fetch_products_bundle_details(
                 ),
                 "subscribe_prices": [
                     {
-                        "month": s.month,
                         "price": s.price,
                         "contract_period_year": s.contract_period_year,
                         "mandatory_period_year": s.mandatory_period_year,
@@ -800,7 +799,6 @@ async def search_products_by_keywords(
                 ),
                 "subscribe_prices": [
                     {
-                        "month": s.month,
                         "price": s.price,
                         "contract_period_year": s.contract_period_year,
                         "mandatory_period_year": s.mandatory_period_year,
