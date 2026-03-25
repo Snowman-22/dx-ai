@@ -187,11 +187,26 @@ def allocate_budget(needed_items: list, budget: int, category_price_stats: dict)
 
 def filter_by_budget(df: pd.DataFrame, allocated_budget: dict, price_col: str = "price") -> pd.DataFrame:
     """
-    각 제품의 카테고리별 배정 예산의 110% 이하인 제품만 남김
-    (벡터화 버전 - df.apply 제거)
+    각 제품의 카테고리별 배정 예산의 110% 이하인 제품만 남김.
+    예산 초과지만 구독 가능한 제품은 유지하여 구독 추천 후보로 활용.
     """
     if df.empty:
         return df.copy()
     budget_series = df["category"].map(allocated_budget)
-    mask = budget_series.isna() | (df[price_col] <= budget_series * 1.1)
-    return df[mask].copy()
+    within_budget = budget_series.isna() | (df[price_col] <= budget_series * 1.1)
+
+    # 예산 초과지만 구독 가능한 제품은 유지
+    if "is_subscribe" in df.columns:
+        is_sub = df["is_subscribe"].fillna(False).astype(bool)
+        mask = within_budget | is_sub
+    else:
+        mask = within_budget
+
+    result = df[mask].copy()
+
+    # 구독으로 살아남은 제품에 추천 플래그
+    if "is_subscribe" in result.columns:
+        budget_filtered = result["category"].map(allocated_budget)
+        over_budget = budget_filtered.notna() & (result[price_col] > budget_filtered * 1.1)
+        result["subscribe_recommended"] = over_budget & result["is_subscribe"].fillna(False).astype(bool)
+    return result
