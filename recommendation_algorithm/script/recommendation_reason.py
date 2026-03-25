@@ -184,5 +184,3 @@ def generate_reasons(
         packages_context.append(ctx)
 
     return _call_openai(client, packages_context, starter, preferences, budget, square_footage)
-
-    return reasons
