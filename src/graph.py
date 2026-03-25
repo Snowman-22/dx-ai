@@ -346,23 +346,39 @@ def _compute_budget_breakdown(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _package_items(pkg: Dict[str, Any]) -> list[Dict[str, Any]]:
+    def _normalized_item(item: Dict[str, Any], *, default_category: str | None = None) -> Dict[str, Any]:
+        normalized = dict(item)
+        if normalized.get("product_id") is None and normalized.get("productId") is not None:
+            normalized["product_id"] = normalized.get("productId")
+        if not _to_str(normalized.get("model_id")) and normalized.get("modelId") is not None:
+            normalized["model_id"] = normalized.get("modelId")
+        if not _to_str(normalized.get("product_name")):
+            name = normalized.get("name")
+            if name is not None:
+                normalized["product_name"] = name
+        if not _to_str(normalized.get("name")) and normalized.get("product_name") is not None:
+            normalized["name"] = normalized.get("product_name")
+        if not _to_str(normalized.get("category")) and default_category:
+            normalized["category"] = default_category
+        return normalized
+
     items: list[Dict[str, Any]] = []
     appliances = pkg.get("appliances")
     furniture = pkg.get("furniture")
 
     if isinstance(appliances, list) or isinstance(furniture, list):
-        for raw in (appliances, furniture):
+        for raw, category in ((appliances, "appliance"), (furniture, "furniture")):
             if isinstance(raw, list):
                 for item in raw:
                     if isinstance(item, dict):
-                        items.append(item)
+                        items.append(_normalized_item(item, default_category=category))
         return items
 
     products = pkg.get("products")
     if isinstance(products, list):
         for item in products:
             if isinstance(item, dict):
-                items.append(item)
+                items.append(_normalized_item(item))
     return items
 
 
@@ -381,6 +397,15 @@ def _package_signature(pkg: Dict[str, Any]) -> tuple[str, ...]:
 
 
 def _sanitize_package_for_response(pkg: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_products = _package_items(pkg)
+    appliances = [
+        item for item in normalized_products
+        if _to_str(item.get("category")).lower() == "appliance"
+    ]
+    furniture = [
+        item for item in normalized_products
+        if _to_str(item.get("category")).lower() == "furniture"
+    ]
     return {
         "package_name": pkg.get("package_name") or pkg.get("theme") or pkg.get("name") or "",
         "recommendationReason": (
@@ -388,8 +413,9 @@ def _sanitize_package_for_response(pkg: Dict[str, Any]) -> Dict[str, Any]:
             or pkg.get("reason")
             or ""
         ),
-        "appliances": pkg.get("appliances") if isinstance(pkg.get("appliances"), list) else [],
-        "furniture": pkg.get("furniture") if isinstance(pkg.get("furniture"), list) else [],
+        "appliances": appliances,
+        "furniture": furniture,
+        "products": normalized_products,
     }
 
 def _append_message(state: ChatState, *, role: str, content: Any) -> List[Dict[str, Any]]:

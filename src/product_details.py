@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import re
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .products_repo import (
@@ -164,6 +164,10 @@ _REQUEST_WORDS: frozenset[str] = frozenset({
     "vs",
 })
 
+_WEAK_SEARCH_TOKENS: frozenset[str] = frozenset({
+    "일반", "기본", "보급형", "표준형", "스탠드", "스탠드형", "벽걸이", "형",
+})
+
 
 def _is_protected_product_token(t: str) -> bool:
     """
@@ -198,6 +202,7 @@ def _strip_sentence_noise(s: str) -> str:
     x = (s or "").strip()
     if not x:
         return ""
+    x = re.sub(r"[\(\)\[\]\{\}<>]", " ", x)
     x = re.sub(r"[?!.,，、]+", " ", x)
     x = re.sub(r"\b(?:please|tell\s+me\s+about|tell\s+me)\b", " ", x, flags=re.I)
     x = re.sub(r"(에\s*대한|에\s*대해|대해서|관련(?:된)?)\s*", " ", x)
@@ -271,6 +276,31 @@ def _split_product_name_segments(query: str) -> list[str]:
     return out if out else ([q] if len(q) >= 2 else [])
 
 
+def _extract_search_tokens(seg: str) -> list[str]:
+    base = _normalize_query_segment(seg)
+    if not base:
+        return []
+    parts = [
+        _strip_korean_josa(t)
+        for t in re.split(r"[\s/|]+", base)
+        if t and len(t.strip()) >= 2
+    ]
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for tok in parts:
+        t = re.sub(r"[^0-9A-Za-z가-힣]+", "", tok).strip()
+        if len(t) < 2:
+            continue
+        if t in _REQUEST_WORDS or t in _REQUEST_WORDS_MINIMAL:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        cleaned.append(t)
+    strong = [t for t in cleaned if t not in _WEAK_SEARCH_TOKENS]
+    return strong if strong else cleaned
+
+
 def _product_entity_to_bundle_item_minimal(p: ProductEntity) -> Dict[str, Any]:
     """리뷰 전용: product 행만 — spec / subscribe_price 조회 없음."""
     return {
@@ -321,44 +351,71 @@ async def search_products_by_name_query(
     async def _rows_for_segment(seg: str) -> list:
         norm_seg = _normalize_query_segment(seg)
         safe = _safe_like_fragment(norm_seg)
-        if len(safe) < 2:
+        tokens = _extract_search_tokens(seg)[:6]
+
+        phrase_conditions = []
+        if len(safe) >= 2:
+            like = f"%{safe}%"
+            phrase_conditions.extend([
+                ProductEntity.product_name.ilike(like),
+                ProductEntity.brand.ilike(like),
+                ProductEntity.category.ilike(like),
+                ProductEntity.product_category.ilike(like),
+            ])
+
+        compact = _safe_like_fragment(re.sub(r"\s+", "", norm_seg))
+        if len(compact) >= 2 and compact != safe.replace(" ", ""):
+            compact_like = f"%{compact}%"
+            phrase_conditions.append(
+                func.replace(ProductEntity.product_name, " ", "").ilike(compact_like)
+            )
+
+        if phrase_conditions:
+            res = await session.execute(
+                select(ProductEntity).where(or_(*phrase_conditions)).limit(limit_per_segment)
+            )
+            rows = list(res.scalars().all())
+            if rows:
+                return rows
+
+        if not tokens:
             return []
-        like = f"%{safe}%"
-        cond = or_(
-            ProductEntity.product_name.ilike(like),
-            ProductEntity.brand.ilike(like),
-            ProductEntity.category.ilike(like),
-            ProductEntity.product_category.ilike(like),
-        )
-        res = await session.execute(
-            select(ProductEntity).where(cond).limit(limit_per_segment)
-        )
-        rows = list(res.scalars().all())
-        if rows:
-            return rows
-        # 전구문 미매칭 시: 공백 토큰 AND (예: Scallop + Shelf)
-        tokens = [
-            t
-            for t in re.split(r"\s+", safe)
-            if len(t) >= 2
-            and (_is_protected_product_token(t) or t not in _REQUEST_WORDS)
-        ]
-        if len(tokens) < 2:
-            tokens = [
-                t
-                for t in re.split(r"\s+", safe)
-                if len(t) >= 2
-                and (_is_protected_product_token(t) or t not in _REQUEST_WORDS_MINIMAL)
-            ]
-        if len(tokens) < 2:
+
+        token_match_exprs = []
+        score_parts = []
+        for tok in tokens:
+            frag = _safe_like_fragment(tok)
+            if len(frag) < 2:
+                continue
+            pn = ProductEntity.product_name.ilike(f"%{frag}%")
+            brand = ProductEntity.brand.ilike(f"%{frag}%")
+            category = ProductEntity.category.ilike(f"%{frag}%")
+            product_category = ProductEntity.product_category.ilike(f"%{frag}%")
+            token_match_exprs.append(or_(pn, brand, category, product_category))
+            score_parts.extend([
+                case((pn, 6), else_=0),
+                case((brand, 4), else_=0),
+                case((category, 3), else_=0),
+                case((product_category, 3), else_=0),
+            ])
+
+        if not token_match_exprs:
             return []
-        tok_conds = [
-            ProductEntity.product_name.ilike(f"%{_safe_like_fragment(t)}%")
-            for t in tokens[:6]
-        ]
-        res2 = await session.execute(
-            select(ProductEntity).where(and_(*tok_conds)).limit(limit_per_segment)
+
+        score_expr = score_parts[0]
+        for part in score_parts[1:]:
+            score_expr = score_expr + part
+        match_count_expr = case((token_match_exprs[0], 1), else_=0)
+        for expr in token_match_exprs[1:]:
+            match_count_expr = match_count_expr + case((expr, 1), else_=0)
+        min_match = 1 if len(token_match_exprs) == 1 else min(2, len(token_match_exprs))
+        stmt = (
+            select(ProductEntity)
+            .where(match_count_expr >= min_match)
+            .order_by(score_expr.desc(), ProductEntity.product_name.asc())
+            .limit(limit_per_segment)
         )
+        res2 = await session.execute(stmt)
         return list(res2.scalars().all())
 
     for seg in segments:
@@ -659,4 +716,3 @@ async def search_products_by_keywords(
         )
 
     return {"products": out}
-
