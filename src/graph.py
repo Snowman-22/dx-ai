@@ -366,13 +366,18 @@ def _package_items(pkg: Dict[str, Any]) -> list[Dict[str, Any]]:
     appliances = pkg.get("appliances")
     furniture = pkg.get("furniture")
 
-    if isinstance(appliances, list) or isinstance(furniture, list):
+    has_nonempty_category_lists = (
+        (isinstance(appliances, list) and len(appliances) > 0)
+        or (isinstance(furniture, list) and len(furniture) > 0)
+    )
+    if has_nonempty_category_lists:
         for raw, category in ((appliances, "appliance"), (furniture, "furniture")):
             if isinstance(raw, list):
                 for item in raw:
                     if isinstance(item, dict):
                         items.append(_normalized_item(item, default_category=category))
-        return items
+        if items:
+            return items
 
     products = pkg.get("products")
     if isinstance(products, list):

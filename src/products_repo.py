@@ -71,8 +71,7 @@ class SubscribePriceEntity(Base):
     subscribe_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int] = mapped_column(Integer, index=True)
 
-    month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     contract_period_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     mandatory_period_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     visit_service_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
