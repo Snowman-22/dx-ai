@@ -197,7 +197,23 @@ def _package_feature_vector(pkg: dict) -> np.ndarray:
                      energy_ratio, premium_ratio, pet_avg, small_ratio])
 
 
-MMR_LAMBDA = 0.6  # 점수 60% + 다양성 40%
+MMR_LAMBDA = 0.5  # 점수 50% + 다양성 50%
+
+
+def _jaccard_similarity(keys_a: set, keys_b: set) -> float:
+    """두 패키지의 제품 ID 기반 Jaccard 유사도"""
+    if not keys_a or not keys_b:
+        return 0.0
+    return len(keys_a & keys_b) / len(keys_a | keys_b)
+
+
+def _cosine_similarity_vec(a: np.ndarray, b: np.ndarray) -> float:
+    """두 특성 벡터의 코사인 유사도"""
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
 
 
 def _mmr_pick_packages(
@@ -207,7 +223,8 @@ def _mmr_pick_packages(
 ) -> list:
     """
     MMR(Maximum Marginal Relevance) 기반 패키지 선택.
-    score = λ × relevance - (1-λ) × max_similarity(기존 선택과의 유사도)
+    유사도 = 0.5 × 특성벡터 코사인 + 0.5 × 제품ID Jaccard
+    score = λ × relevance - (1-λ) × max_similarity
     """
     if not packages:
         return []
@@ -223,8 +240,9 @@ def _mmr_pick_packages(
     if not candidates:
         return []
 
-    # 특성 벡터 + 점수 사전 계산
+    # 사전 계산: 특성 벡터 + 제품 키 + 점수
     vectors = [_package_feature_vector(pkg) for pkg in candidates]
+    key_sets = [_package_product_keys(pkg) for pkg in candidates]
     scores = np.array([pkg.get("theme_score", pkg.get("package_score", 0.0))
                        for pkg in candidates])
 
@@ -235,38 +253,32 @@ def _mmr_pick_packages(
     else:
         norm_scores = np.ones(len(scores))
 
-    # 기존 테마에서 선택된 패키지의 벡터 (크로스 테마 다양성)
-    existing_vectors = [_package_feature_vector(tp["package"]) for tp in existing_themed]
+    # 기존 선택 정보 (크로스 테마 다양성)
+    selected_vectors = [_package_feature_vector(tp["package"]) for tp in existing_themed]
+    selected_keys = [_package_product_keys(tp["package"]) for tp in existing_themed]
 
     selected = []
-    selected_vectors = list(existing_vectors)  # 기존 + 신규 모두 포함
     used_indices = set()
 
     for _ in range(n):
         best_idx = -1
         best_mmr = -float("inf")
 
-        for i, pkg in enumerate(candidates):
+        for i in range(len(candidates)):
             if i in used_indices:
                 continue
 
             relevance = norm_scores[i]
 
-            # 기존 선택과의 최대 유사도
+            # 하이브리드 유사도: 특성벡터 코사인 + 제품ID Jaccard
             if selected_vectors:
-                sims = []
-                vec_i = vectors[i]
-                norm_i = np.linalg.norm(vec_i)
-                if norm_i == 0:
-                    max_sim = 0.0
-                else:
-                    for sv in selected_vectors:
-                        norm_sv = np.linalg.norm(sv)
-                        if norm_sv == 0:
-                            sims.append(0.0)
-                        else:
-                            sims.append(float(np.dot(vec_i, sv) / (norm_i * norm_sv)))
-                    max_sim = max(sims)
+                max_sim = 0.0
+                for sv, sk in zip(selected_vectors, selected_keys):
+                    cos_sim = _cosine_similarity_vec(vectors[i], sv)
+                    jac_sim = _jaccard_similarity(key_sets[i], sk)
+                    hybrid = 0.5 * cos_sim + 0.5 * jac_sim
+                    if hybrid > max_sim:
+                        max_sim = hybrid
             else:
                 max_sim = 0.0
 
@@ -281,6 +293,7 @@ def _mmr_pick_packages(
 
         selected.append(candidates[best_idx])
         selected_vectors.append(vectors[best_idx])
+        selected_keys.append(key_sets[best_idx])
         used_indices.add(best_idx)
 
     return selected
@@ -1025,7 +1038,7 @@ def run_scoring(
         packages = generate_packages(
             reranked, budget,
             candidates=theme_candidates,
-            max_packages=20,
+            max_packages=30,
         )
 
         # 테마 점수로 재정렬
