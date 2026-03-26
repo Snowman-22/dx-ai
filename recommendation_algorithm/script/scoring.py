@@ -1157,39 +1157,41 @@ def run_scoring(
         # 카테고리를 최저가 오름차순 정렬 (저가 카테고리 우선 포함)
         sorted_cats = sorted(cat_min.keys(), key=lambda c: cat_min[c])
 
-        # 가능한 조합 탐색 (카테고리 2개~전체, 큰 조합 우선)
+        # 가능한 조합 탐색 (큰 조합 우선, 최대 3개)
         valid_combos = []
         for size in range(len(sorted_cats), 1, -1):
             for combo in itertools.combinations(sorted_cats, size):
                 combo_min = sum(cat_min[c] for c in combo)
                 if combo_min <= budget_cap:
                     valid_combos.append(combo)
+                if len(valid_combos) >= 3:
+                    break
             if valid_combos:
-                break  # 가장 큰 사이즈의 유효 조합을 찾으면 중단
+                break
 
-        # 유효 조합이 없으면 2개 조합까지 허용
         if not valid_combos:
             for combo in itertools.combinations(sorted_cats, 2):
                 valid_combos.append(combo)
+                if len(valid_combos) >= 3:
+                    break
 
-        # 조합별로 패키지 생성 → 합산
+        # 조합별로 패키지 생성 (최대 3개 조합 × 1개 테마 = 3회 호출)
         all_combo_packages = []
-        for combo in valid_combos[:6]:  # 최대 6개 조합
+        for combo in valid_combos[:3]:
             combo_reranked = {c: reranked[c] for c in combo if c in reranked}
-            for theme in themes[:2]:  # 조합당 2개 테마
-                theme_candidates = _get_theme_candidates(combo_reranked, theme)
-                packages = generate_packages(
-                    combo_reranked, budget,
-                    candidates=theme_candidates,
-                    max_packages=10,
-                    apply_budget_cap=False,
-                )
-                for pkg in packages:
-                    pkg["theme_score"] = _score_by_theme(pkg, theme, budget)
-                packages.sort(key=lambda p: p["theme_score"], reverse=True)
-                all_combo_packages.extend(
-                    [{"theme": theme, "package": pkg} for pkg in packages[:3]]
-                )
+            theme_candidates = _get_theme_candidates(combo_reranked, themes[0])
+            packages = generate_packages(
+                combo_reranked, budget,
+                candidates=theme_candidates,
+                max_packages=15,
+                apply_budget_cap=False,
+            )
+            for pkg in packages:
+                pkg["theme_score"] = _score_by_theme(pkg, themes[0], budget)
+            packages.sort(key=lambda p: p["theme_score"], reverse=True)
+            all_combo_packages.extend(
+                [{"theme": themes[0], "package": pkg} for pkg in packages[:5]]
+            )
 
         # MMR로 최종 12개 선택
         if all_combo_packages:
