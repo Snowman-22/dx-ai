@@ -57,8 +57,7 @@ class ProductEntity(Base):
 class ProductSpecEntity(Base):
     __tablename__ = "product_spec"
 
-    product_spec_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    product_id: Mapped[int] = mapped_column(Integer, index=True)
+    product_id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     width: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     height: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -72,8 +71,7 @@ class SubscribePriceEntity(Base):
     subscribe_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int] = mapped_column(Integer, index=True)
 
-    month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     contract_period_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     mandatory_period_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     visit_service_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -149,4 +147,3 @@ async def vector_search_products(
     (나중에 `product`에 pgvector 컬럼을 두면 여기서 조회하도록 연결하면 됩니다.)
     """
     return []
-
