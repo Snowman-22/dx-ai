@@ -1384,6 +1384,221 @@ def _score_product_name_vs_question(product_name: str, question: str) -> int:
     return score
 
 
+def _cleanup_compare_subject_text(text: str) -> str:
+    s = _to_str(text).strip()
+    if not s:
+        return ""
+    s = re.sub(r"^[\"'`\[\](){}<>\s]+", "", s)
+    s = re.sub(r"[\"'`\[\](){}<>\s]+$", "", s)
+    s = re.sub(r"^(?:그러면|그럼|혹시|근데|그런데|비교하면|비교할때)\s*", "", s, flags=re.I)
+    s = re.sub(
+        r"\s*(?:중(?:에|에서)?\s*)?(?:뭐가.*|뭐를.*|어떤.*|비교.*|차이.*|살까.*|좋을까.*|나을까.*|추천.*)?$",
+        "",
+        s,
+        flags=re.I,
+    )
+    return s.strip(" ,./")
+
+
+def _extract_compare_subjects(question: str) -> list[str]:
+    s = _to_str(question).strip()
+    if not s:
+        return []
+
+    patterns = [
+        r"(.+?)\s+(?:vs\.?|versus)\s+(.+)",
+        r"(.+?)\s*(?:과|와|랑|하고)\s+(.+)",
+    ]
+    for pat in patterns:
+        m = re.match(pat, s, flags=re.I)
+        if not m:
+            continue
+        left = _cleanup_compare_subject_text(m.group(1))
+        right = _cleanup_compare_subject_text(m.group(2))
+        if left and right:
+            return [left, right]
+    return []
+
+
+def _find_best_model_id_in_recommendations(
+    question: str,
+    all_recs: Any,
+) -> tuple[Optional[str], Optional[int], int]:
+    if not isinstance(all_recs, list) or not _to_str(question).strip():
+        return None, None, 0
+
+    qn_flat = _norm_match_text(question)
+    best_mid: Optional[str] = None
+    best_pkg: Optional[int] = None
+    best_score = 0
+
+    for pi, pkg in enumerate(all_recs):
+        if not isinstance(pkg, dict):
+            continue
+        products = _package_items(pkg)
+        if not isinstance(products, list):
+            continue
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            mid = _to_str(p.get("model_id"))
+            if not mid:
+                continue
+            pname = _to_str(p.get("product_name") or p.get("name"))
+            sc = _score_product_name_vs_question(pname, question) if pname else 0
+            if mid.lower() in qn_flat or mid in question:
+                sc = max(sc, 900 + len(mid))
+            if sc > best_score:
+                best_mid = mid
+                best_pkg = pi
+                best_score = sc
+
+    return best_mid, best_pkg, best_score
+
+
+async def _resolve_compare_targets(
+    session: Any,
+    *,
+    question: str,
+    all_recs: Any,
+) -> tuple[list[str], list[str], Optional[int]]:
+    subjects = _extract_compare_subjects(question)
+    if len(subjects) != 2:
+        logger.info(
+            "RECOMMEND_RAG compare-target parse: no structured subjects for question=%r",
+            question,
+        )
+        return [], [], None
+
+    model_ids: list[str] = []
+    resolved_subjects: list[str] = []
+    seen: set[str] = set()
+    package_idx: Optional[int] = None
+
+    for subject in subjects:
+        best_mid, best_pkg, best_score = _find_best_model_id_in_recommendations(subject, all_recs)
+        chosen_mid: Optional[str] = None
+
+        if best_mid and best_score >= 30:
+            chosen_mid = best_mid
+            if package_idx is None and best_pkg is not None:
+                package_idx = best_pkg
+            logger.info(
+                "RECOMMEND_RAG compare-target recommendation hit: subject=%r model_id=%s score=%s pkg_idx=%s",
+                subject,
+                best_mid,
+                best_score,
+                best_pkg,
+            )
+        else:
+            details = await search_products_by_name_query(session, query=subject)
+            products = details.get("products") or []
+            if products:
+                chosen_mid = _to_str(products[0].get("model_id"))
+                logger.info(
+                    "RECOMMEND_RAG compare-target DB hit: subject=%r model_id=%s",
+                    subject,
+                    chosen_mid,
+                )
+            else:
+                logger.info(
+                    "RECOMMEND_RAG compare-target unresolved: subject=%r score=%s",
+                    subject,
+                    best_score,
+                )
+
+        if chosen_mid and chosen_mid not in seen:
+            seen.add(chosen_mid)
+            model_ids.append(chosen_mid)
+            resolved_subjects.append(subject)
+
+    logger.info(
+        "RECOMMEND_RAG compare-target result: question=%r subjects=%s model_ids=%s package_idx=%s",
+        question,
+        subjects,
+        model_ids,
+        package_idx,
+    )
+    return model_ids, resolved_subjects, package_idx
+
+
+def _extract_package_index(text: str) -> Optional[int]:
+    raw = _to_str(text)
+    if not raw.strip():
+        return None
+
+    compact = _norm_match_text(raw)
+    compact = (
+        compact.replace("첫번쨰", "첫번째")
+        .replace("첫번재", "첫번째")
+        .replace("두번쨰", "두번째")
+        .replace("두번재", "두번째")
+        .replace("세번쨰", "세번째")
+        .replace("세번재", "세번째")
+    )
+
+    numeric_patterns = [
+        r"(?:추천)?패키지(\d+)",
+        r"(\d+)(?:번|번째)(?:추천)?패키지",
+        r"(?:추천)?(\d+)번(?:패키지)?",
+        r"(\d+)\s*번",
+        r"(\d+)\s*번째",
+    ]
+    for pat in numeric_patterns:
+        m = re.search(pat, compact, flags=re.I)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n > 0:
+            return n - 1
+
+    ordinal_patterns = [
+        (0, [
+            r"첫번째추천패키지",
+            r"첫번째패키지",
+            r"첫번째로추천된거",
+            r"첫번째로추천한거",
+            r"첫번째거",
+            r"첫째패키지",
+            r"맨처음거",
+            r"제일처음거",
+            r"처음추천한거",
+            r"처음보여준거",
+            r"맨첫거",
+            r"맨위거",
+            r"제일위거",
+        ]),
+        (1, [
+            r"두번째추천패키지",
+            r"두번째패키지",
+            r"두번째로추천된거",
+            r"두번째거",
+            r"둘째패키지",
+        ]),
+        (2, [
+            r"세번째추천패키지",
+            r"세번째패키지",
+            r"세번째로추천된거",
+            r"세번째거",
+            r"셋째패키지",
+        ]),
+    ]
+    for idx, patterns in ordinal_patterns:
+        if any(re.search(pat, compact, flags=re.I) for pat in patterns):
+            return idx
+
+    if "첫" in raw:
+        return 0
+    if "두" in raw:
+        return 1
+    if "세" in raw:
+        return 2
+    return None
+
+
 def _find_model_ids_by_product_name(
     question: str,
     all_recs: Any,
@@ -1469,16 +1684,6 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
     want_review = _want_review_intent(question_str)
     logger.info("RECOMMEND_RAG intent: question=%r want_review=%s", question_str, want_review)
 
-    def _extract_package_index(text: str) -> Optional[int]:
-        m = re.search(r"(\d+)\s*번", text)
-        if m:
-            try: return int(m.group(1)) - 1
-            except ValueError: return None
-        if "첫" in text: return 0
-        if "두" in text: return 1
-        if "세" in text: return 2
-        return None
-
     package_idx: Optional[int] = explicit_pkg_idx
     if package_idx is None:
         package_idx = _extract_package_index(_to_str(question_str))
@@ -1541,6 +1746,10 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                             question_str,
                         )
                         prompt = None
+
+    compare_model_ids: List[str] = []
+    compare_subjects: List[str] = []
+    compare_pkg_idx: Optional[int] = None
 
     # 추천 리스트가 있을 때 '같은 가격대'·'다른 가전' 등 follow-up 의도면,
     # 질문 전체로 search_products_by_name_query 가 먼저 성공해 prompt 가 고정되면
@@ -1687,6 +1896,24 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             want_semantic,
         )
 
+        if want_compare:
+            try:
+                session_maker = get_session_maker()
+                async with session_maker() as session:
+                    compare_model_ids, compare_subjects, compare_pkg_idx = await _resolve_compare_targets(
+                        session,
+                        question=question_str,
+                        all_recs=new_data.get("recommendation_list") or [],
+                    )
+            except Exception:
+                logger.exception(
+                    "RECOMMEND_RAG compare-target resolution failed: question=%r",
+                    question_str,
+                )
+                compare_model_ids = []
+                compare_subjects = []
+                compare_pkg_idx = None
+
         # ── 추천 상품 model_id 수집 ──
         all_recs = new_data.get("recommendation_list") or []
         rec_model_ids: List[str] = []
@@ -1711,6 +1938,14 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
             rec_model_ids,
             rec_product_ids,
         )
+        if compare_model_ids:
+            logger.info(
+                "RECOMMEND_RAG compare-target pool override: subjects=%s model_ids=%s pkg_idx=%s",
+                compare_subjects,
+                compare_model_ids,
+                compare_pkg_idx,
+            )
+        comparison_target_ids = compare_model_ids if len(compare_model_ids) >= 2 else []
 
         # ── 키워드 추출 ──
         search_keywords: List[str] = []
@@ -1807,13 +2042,15 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                         )
                 else:
                     # 1) 추천 상품 상세
-                    if rec_model_ids:
+                    recommended_input_ids = comparison_target_ids or rec_model_ids
+                    if recommended_input_ids:
                         recommended_details = await fetch_products_bundle_details(
-                            session, model_ids=rec_model_ids
+                            session, model_ids=recommended_input_ids
                         )
                         logger.info(
-                            "RECOMMEND_RAG recommended_details fetched count=%s",
+                            "RECOMMEND_RAG recommended_details fetched count=%s model_ids=%s",
                             len(recommended_details.get("products") or []),
+                            recommended_input_ids,
                         )
 
                     # 2) 키워드 검색
@@ -1856,13 +2093,15 @@ async def node_recommend_rag(state: ChatState) -> ChatState:
                         )
 
                 # 4) 상품 비교
-                if want_compare and rec_model_ids:
+                compare_input_ids = comparison_target_ids or rec_model_ids
+                if want_compare and compare_input_ids:
                     comparison_data = await fetch_products_comparison(
-                        session, model_ids=rec_model_ids
+                        session, model_ids=compare_input_ids
                     )
                     logger.info(
-                        "RECOMMEND_RAG comparison fetched count=%s",
+                        "RECOMMEND_RAG comparison fetched count=%s model_ids=%s",
                         len(comparison_data or []),
+                        compare_input_ids,
                     )
 
                 # 5) 시맨틱(벡터) 검색
