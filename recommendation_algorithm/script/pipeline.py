@@ -48,9 +48,13 @@ def parse_input(input_data: dict) -> dict:
     electronics = products.get("electronics", {})
     furniture   = products.get("furniture", {})
 
+    MIN_BUDGET = 1_500_000  # 최소 예산 150만원
+    raw_budget = input_data.get("budget", 0)
+    budget = max(raw_budget, MIN_BUDGET) if raw_budget > 0 else MIN_BUDGET
+
     return {
         "starter":          input_data.get("starter_package") or input_data.get("starterPackage", ""),
-        "budget":           input_data.get("budget", 0),
+        "budget":           budget,
         "square_footage":   input_data.get("square_footage") or input_data.get("squareFootage"),
         "preferences":      input_data.get("preferences", []),
         "style":            input_data.get("style"),

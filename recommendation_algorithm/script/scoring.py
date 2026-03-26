@@ -351,7 +351,7 @@ def _calc_package_score(products: list, budget: int) -> float:
     return 0.8 * avg_score + 0.2 * budget_fit
 
 
-def generate_packages(results: dict, budget: int, candidates: dict = None, max_packages: int = None) -> list:
+def generate_packages(results: dict, budget: int, candidates: dict = None, max_packages: int = None, apply_budget_cap: bool = True) -> list:
     """
     numpy 벡터화 전수탐색으로 조합 생성
     - candidates: 미리 선정된 후보 (None이면 _get_candidates 사용)
@@ -468,7 +468,7 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
     package_scores = 0.8 * avg_scores + 0.2 * budget_fits
 
     # 패키지 총 정가가 예산의 3배를 초과하면 선택 불가
-    if budget > 0:
+    if budget > 0 and apply_budget_cap:
         original_price_sum = np.zeros(total_combos, dtype=np.int64)
         for cat_i in range(n_categories):
             cat_op = np.array([int(float(p.get("original_price", 0) or p.get("price", 0) or 0)) for p in effective_lists[cat_i]])
@@ -1136,16 +1136,18 @@ def run_scoring(
         fallback = generate_packages(reranked, budget)
         themed_packages = _enforce_minimum_output(themed_packages, fallback, reranked, budget)
 
-    # 대부분의 패키지가 예산*3 초과 → 부분 조합 방식으로 재생성
-    if budget_cap > 0 and themed_packages:
-        def _real_price(pkg_item):
-            products = pkg_item["package"].get("products", [])
-            return sum(int(float(p.get("original_price", 0) or p.get("price", 0) or 0)) for p in products)
-        over_count = sum(1 for pkg in themed_packages if _real_price(pkg) > budget_cap)
-        mostly_over = over_count >= len(themed_packages) * 0.8
-        if mostly_over:
+    # 패키지 부족 또는 대부분 예산*3 초과 → 부분 조합 방식으로 재생성
+    if budget_cap > 0:
+        if not themed_packages:
             budget_tight = True
-            themed_packages = []
+        elif themed_packages:
+            def _real_price(pkg_item):
+                products = pkg_item["package"].get("products", [])
+                return sum(int(float(p.get("original_price", 0) or p.get("price", 0) or 0)) for p in products)
+            over_count = sum(1 for pkg in themed_packages if _real_price(pkg) > budget_cap)
+            if over_count >= len(themed_packages) * 0.8:
+                budget_tight = True
+                themed_packages = []
 
     if budget_tight:
         # ── 예산 부족: 카테고리 부분 조합으로 패키지 생성 ──
@@ -1180,6 +1182,7 @@ def run_scoring(
                     combo_reranked, budget,
                     candidates=theme_candidates,
                     max_packages=10,
+                    apply_budget_cap=False,
                 )
                 for pkg in packages:
                     pkg["theme_score"] = _score_by_theme(pkg, theme, budget)
