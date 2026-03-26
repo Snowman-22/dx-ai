@@ -799,15 +799,18 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
             adjusted.append({"theme": "밸런스", "package": fixed_pkg})
 
     if len(adjusted) < MIN_PACKAGES:
-        # 2차: 예산 상한 완화 (부족하면 채움)
+        # 2차: 시그니처 중복 허용하되 예산 상한은 유지
         for pkg in all_packages:
             if len(adjusted) >= MIN_PACKAGES:
                 break
             if not isinstance(pkg, dict):
                 continue
+            if budget_cap > 0 and pkg.get("total_price", 0) > budget_cap:
+                continue
             fixed_pkg = _ensure_min_products(pkg, global_pool, MIN_PRODUCTS_PER_PACKAGE)
             adjusted.append({"theme": "밸런스", "package": fixed_pkg})
 
+    # 12개 못 채워도 예산 상한 내의 패키지만 반환
     return adjusted
 
 
@@ -1095,88 +1098,117 @@ def run_scoring(
     # 1. 재정렬
     reranked = rerank(results)
 
-    # 2. 예산 상한 초과 시 우선순위 낮은 카테고리 제거
-    #    우선순위: 가전 > 가구, 같은 유형 내 고가 먼저 제거
+    # 2. 예산 상한 판정
     BUDGET_CAP_RATIO = 3
-    if budget > 0:
-        max_total = budget * BUDGET_CAP_RATIO
+    budget_cap = budget * BUDGET_CAP_RATIO if budget > 0 else 0
 
-        # 카테고리별 추천 예상가 계산 (상위 3개 평균 = 실제 추천될 가격대)
-        cat_min_prices = {}
-        for cat, df in reranked.items():
-            if df.empty:
-                continue
-            if "price" in df.columns:
-                prices = df["price"].dropna().sort_values()
-                top_prices = prices.head(3)
-                est_price = int(top_prices.mean()) if not top_prices.empty else 0
-                cat_min_prices[cat] = est_price
-
-        total_min = sum(cat_min_prices.values())
-
-        if total_min > max_total:
-            # 가구(고가→저가) 먼저 제거, 그 다음 가전(고가→저가)
-            furn_cats = sorted(
-                [(c, p) for c, p in cat_min_prices.items() if c not in ELECTRONICS_CATEGORIES],
-                key=lambda x: -x[1],
-            )
-            elec_cats = sorted(
-                [(c, p) for c, p in cat_min_prices.items() if c in ELECTRONICS_CATEGORIES],
-                key=lambda x: -x[1],
-            )
-            drop_order = furn_cats + elec_cats
-
-            for cat, price in drop_order:
-                if total_min <= max_total:
-                    break
-                # 최소 2개 카테고리는 남겨야 함
-                if len(reranked) <= 2:
-                    break
-                total_min -= price
-                del reranked[cat]
+    # 카테고리별 최저가 (드롭 판정용) + 후보 예상가 (tight 판정용)
+    all_cats = list(reranked.keys())
+    cat_min = {}
+    cat_est = {}
+    for cat, df in reranked.items():
+        if not df.empty and "price" in df.columns:
+            cat_min[cat] = int(df["price"].min())
+            # 후보 상위 3개 평균 = 실제 추천될 가격대
+            top3 = df["price"].dropna().sort_values().head(3)
+            cat_est[cat] = int(top3.mean()) if not top3.empty else 0
+    # 후보 예상가 합이 상한을 넘으면 budget_tight
+    total_est = sum(cat_est.values())
+    budget_tight = budget > 0 and total_est > budget_cap
 
     # 3. 테마 결정
     themes = _determine_themes(preferences)
 
-    # 4. 첫 테마로 유효 패키지 존재 여부 확인, 없으면 카테고리 반복 드롭
-    if budget > 0:
-        test_candidates = _get_theme_candidates(reranked, themes[0])
-        test_packages = generate_packages(reranked, budget, candidates=test_candidates, max_packages=5)
-        while not test_packages and len(reranked) > 2:
-            expensive = max(
-                reranked.keys(),
-                key=lambda c: reranked[c]["price"].median()
-                if not reranked[c].empty and "price" in reranked[c].columns else 0,
-            )
-            del reranked[expensive]
-            test_candidates = _get_theme_candidates(reranked, themes[0])
-            test_packages = generate_packages(reranked, budget, candidates=test_candidates, max_packages=5)
-
-    # 5. 멀티 전략 앙상블 + MMR 다양성 선택
+    # 4. 패키지 생성 — 먼저 전체 카테고리로 시도
     themed_packages = []
 
     for theme in themes:
         theme_candidates = _get_theme_candidates(reranked, theme)
-
         packages = generate_packages(
             reranked, budget,
             candidates=theme_candidates,
             max_packages=30,
         )
-
-        # 테마 점수로 재정렬
         for pkg in packages:
             pkg["theme_score"] = _score_by_theme(pkg, theme, budget)
         packages.sort(key=lambda p: p["theme_score"], reverse=True)
-
         picked = _mmr_pick_packages(packages, N_PER_THEME, themed_packages)
         for pkg in picked:
             themed_packages.append({"theme": theme, "package": pkg})
 
-    # 4. 최소 12개 보장 — 부족하면 밸런스 풀에서 추가
     if len(themed_packages) < MIN_PACKAGES:
         fallback = generate_packages(reranked, budget)
         themed_packages = _enforce_minimum_output(themed_packages, fallback, reranked, budget)
+
+    # 대부분의 패키지가 예산*3 초과 → 부분 조합 방식으로 재생성
+    if budget_cap > 0 and themed_packages:
+        def _real_price(pkg_item):
+            products = pkg_item["package"].get("products", [])
+            return sum(int(float(p.get("price", 0) or 0)) for p in products)
+        over_count = sum(1 for pkg in themed_packages if _real_price(pkg) > budget_cap)
+        mostly_over = over_count >= len(themed_packages) * 0.8
+        if mostly_over:
+            budget_tight = True
+            themed_packages = []
+
+    if budget_tight:
+        # ── 예산 부족: 카테고리 부분 조합으로 패키지 생성 ──
+        # 예산*3 이내에 들어가는 카테고리 조합들을 찾아서 각각 패키지 생성
+        import itertools
+
+        # 카테고리를 최저가 오름차순 정렬 (저가 카테고리 우선 포함)
+        sorted_cats = sorted(cat_min.keys(), key=lambda c: cat_min[c])
+
+        # 가능한 조합 탐색 (카테고리 2개~전체, 큰 조합 우선)
+        valid_combos = []
+        for size in range(len(sorted_cats), 1, -1):
+            for combo in itertools.combinations(sorted_cats, size):
+                combo_min = sum(cat_min[c] for c in combo)
+                if combo_min <= budget_cap:
+                    valid_combos.append(combo)
+            if valid_combos:
+                break  # 가장 큰 사이즈의 유효 조합을 찾으면 중단
+
+        # 유효 조합이 없으면 2개 조합까지 허용
+        if not valid_combos:
+            for combo in itertools.combinations(sorted_cats, 2):
+                valid_combos.append(combo)
+
+        # 조합별로 패키지 생성 → 합산
+        all_combo_packages = []
+        for combo in valid_combos[:6]:  # 최대 6개 조합
+            combo_reranked = {c: reranked[c] for c in combo if c in reranked}
+            for theme in themes[:2]:  # 조합당 2개 테마
+                theme_candidates = _get_theme_candidates(combo_reranked, theme)
+                packages = generate_packages(
+                    combo_reranked, budget,
+                    candidates=theme_candidates,
+                    max_packages=10,
+                )
+                for pkg in packages:
+                    pkg["theme_score"] = _score_by_theme(pkg, theme, budget)
+                packages.sort(key=lambda p: p["theme_score"], reverse=True)
+                all_combo_packages.extend(
+                    [{"theme": theme, "package": pkg} for pkg in packages[:3]]
+                )
+
+        # MMR로 최종 12개 선택
+        if all_combo_packages:
+            final_packages = [item["package"] for item in all_combo_packages]
+            for pkg in final_packages:
+                if "theme_score" not in pkg:
+                    pkg["theme_score"] = pkg.get("package_score", 0.0)
+            final_packages.sort(key=lambda p: p["theme_score"], reverse=True)
+
+            picked = _mmr_pick_packages(final_packages, MIN_PACKAGES, [])
+            for pkg in picked:
+                # 테마 찾기
+                theme_name = "밸런스"
+                for item in all_combo_packages:
+                    if item["package"] is pkg:
+                        theme_name = item["theme"]
+                        break
+                themed_packages.append({"theme": theme_name, "package": pkg})
 
     # 5. 추천 이유 생성
     if use_llm and themed_packages:
