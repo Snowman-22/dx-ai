@@ -467,6 +467,15 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
 
     package_scores = 0.8 * avg_scores + 0.2 * budget_fits
 
+    # 패키지 총 할인가가 예산의 4배를 초과하면 점수 대폭 감점 (가능한 한 저가 우선)
+    if budget > 0:
+        discount_price_sum = np.zeros(total_combos, dtype=np.int64)
+        for cat_i in range(n_categories):
+            cat_dp = np.array([int(float(p.get("price", 0) or 0)) for p in effective_lists[cat_i]])
+            discount_price_sum += cat_dp[idx_arrays[cat_i]]
+        over_cap = discount_price_sum > budget * 4
+        package_scores[over_cap] *= 0.1  # 4배 초과 시 점수 90% 감점
+
     # ── PID 인덱스 매핑 (numpy 레벨에서 빠른 다양성 체크) ────────
     # cat_pid_arrays[cat_i] = idx_arrays[cat_i]에 대응하는 product_id 배열
     cat_pid_arrays = []
