@@ -205,10 +205,11 @@ def filter_by_budget(df: pd.DataFrame, allocated_budget: dict, price_col: str = 
     budget_series = df["category"].map(allocated_budget)
     within_budget = budget_series.isna() | (df[price_col] <= budget_series * 1.1)
 
-    # 예산 초과지만 구독 가능한 제품은 유지
+    # 예산 초과지만 구독 가능한 제품은 유지 (단, 배정 예산의 3배 이하)
     if "is_subscribe" in df.columns:
         is_sub = df["is_subscribe"].fillna(False).astype(bool)
-        mask = within_budget | is_sub
+        sub_cap = budget_series.notna() & (df[price_col] <= budget_series * 3)
+        mask = within_budget | (is_sub & sub_cap)
     else:
         mask = within_budget
 
