@@ -420,7 +420,7 @@ def _sanitize_package_for_response(pkg: Dict[str, Any]) -> Dict[str, Any]:
         item for item in normalized_products
         if _to_str(item.get("category")).lower() == "furniture"
     ]
-    return {
+    result = {
         "package_name": pkg.get("package_name") or pkg.get("theme") or pkg.get("name") or "",
         "recommendationReason": (
             pkg.get("recommendationReason")
@@ -431,6 +431,9 @@ def _sanitize_package_for_response(pkg: Dict[str, Any]) -> Dict[str, Any]:
         "furniture": furniture,
         "products": normalized_products,
     }
+    if pkg.get("recommendationPlus") is not None:
+        result["recommendationPlus"] = pkg["recommendationPlus"]
+    return result
 
 def _append_message(state: ChatState, *, role: str, content: Any) -> List[Dict[str, Any]]:
     messages = list(state.get("messages") or [])
