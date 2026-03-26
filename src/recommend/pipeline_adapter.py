@@ -162,6 +162,7 @@ def pipeline_output_to_recommendation_list(output: Any) -> Dict[str, Any]:
             continue
         theme = pkg.get("theme") or f"패키지 {i + 1}"
         reason = pkg.get("recommendationReason") or pkg.get("reason") or ""
+        reason_plus = pkg.get("recommendationPlus")
         appliances_raw = pkg.get("appliances") if isinstance(pkg.get("appliances"), list) else []
         furniture_raw = pkg.get("furniture") if isinstance(pkg.get("furniture"), list) else []
 
@@ -180,6 +181,7 @@ def pipeline_output_to_recommendation_list(output: Any) -> Dict[str, Any]:
                 "theme": theme,
                 "reason": reason,
                 "recommendationReason": reason,
+                "recommendationPlus": reason_plus,
                 "appliances": appliances_raw,
                 "furniture": furniture_raw,
                 "products": products,
