@@ -75,6 +75,7 @@ def fetch_electronics(engine, needed_categories: list) -> pd.DataFrame:
         WHERE p.product_category IN ({placeholders})
           AND p.category = 'APPLIANCE'
           AND p.discount_price IS NOT NULL
+          AND (p.is_used IS NULL OR p.is_used = true)
     """)
 
     with engine.connect() as conn:
@@ -127,6 +128,7 @@ def fetch_furniture(engine, needed_categories: list) -> pd.DataFrame:
         WHERE p.product_category IN ({placeholders})
           AND p.category = 'furniture'
           AND p.discount_price IS NOT NULL
+          AND (p.is_used IS NULL OR p.is_used = true)
     """)
 
     with engine.connect() as conn:
