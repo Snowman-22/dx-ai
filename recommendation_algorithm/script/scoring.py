@@ -473,8 +473,8 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
         for cat_i in range(n_categories):
             cat_dp = np.array([int(float(p.get("price", 0) or 0)) for p in effective_lists[cat_i]])
             discount_price_sum += cat_dp[idx_arrays[cat_i]]
-        over_cap = discount_price_sum > budget * 4
-        package_scores[over_cap] *= 0.1  # 4배 초과 시 점수 90% 감점
+        over_cap = discount_price_sum > budget * 3
+        package_scores[over_cap] *= 0.1  # 3배 초과 시 점수 90% 감점
 
     # ── PID 인덱스 매핑 (numpy 레벨에서 빠른 다양성 체크) ────────
     # cat_pid_arrays[cat_i] = idx_arrays[cat_i]에 대응하는 product_id 배열
@@ -1088,7 +1088,45 @@ def run_scoring(
     # 1. 재정렬
     reranked = rerank(results)
 
-    # 2. 테마 결정
+    # 2. 예산 상한 초과 시 우선순위 낮은 카테고리 제거
+    #    우선순위: 가전 > 가구, 같은 유형 내 고가 먼저 제거
+    BUDGET_CAP_RATIO = 3
+    if budget > 0:
+        max_total = budget * BUDGET_CAP_RATIO
+
+        # 카테고리별 최저 할인가 계산 (구독 총비용이 아닌 실제 판매가 기준)
+        cat_min_prices = {}
+        for cat, df in reranked.items():
+            if df.empty:
+                continue
+            if "price" in df.columns:
+                min_price = int(df["price"].dropna().min()) if not df["price"].dropna().empty else 0
+                cat_min_prices[cat] = min_price
+
+        total_min = sum(cat_min_prices.values())
+
+        if total_min > max_total:
+            # 가구(고가→저가) 먼저 제거, 그 다음 가전(고가→저가)
+            furn_cats = sorted(
+                [(c, p) for c, p in cat_min_prices.items() if c not in ELECTRONICS_CATEGORIES],
+                key=lambda x: -x[1],
+            )
+            elec_cats = sorted(
+                [(c, p) for c, p in cat_min_prices.items() if c in ELECTRONICS_CATEGORIES],
+                key=lambda x: -x[1],
+            )
+            drop_order = furn_cats + elec_cats
+
+            for cat, price in drop_order:
+                if total_min <= max_total:
+                    break
+                # 최소 2개 카테고리는 남겨야 함
+                if len(reranked) <= 2:
+                    break
+                total_min -= price
+                del reranked[cat]
+
+    # 3. 테마 결정
     themes = _determine_themes(preferences)
 
     # 3. 멀티 전략 앙상블 + MMR 다양성 선택
