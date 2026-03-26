@@ -474,7 +474,7 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
             cat_dp = np.array([int(float(p.get("price", 0) or 0)) for p in effective_lists[cat_i]])
             discount_price_sum += cat_dp[idx_arrays[cat_i]]
         over_cap = discount_price_sum > budget * 3
-        package_scores[over_cap] *= 0.1  # 3배 초과 시 점수 90% 감점
+        package_scores[over_cap] = -1.0  # 3배 초과 시 선택 불가
 
     # ── PID 인덱스 매핑 (numpy 레벨에서 빠른 다양성 체크) ────────
     # cat_pid_arrays[cat_i] = idx_arrays[cat_i]에 대응하는 product_id 배열
@@ -555,6 +555,8 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
                     for cat_i in range(n_categories)]
 
         pkg_score   = float(package_scores[flat_idx])
+        if pkg_score <= 0:
+            continue  # 예산 상한 초과 등으로 차단된 패키지
         total_price = int(price_sum[flat_idx])
 
         pids    = [p.get("product_id") for p in products]
@@ -598,9 +600,11 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
             if too_similar:
                 continue
 
+            pkg_score   = float(package_scores[flat_idx])
+            if pkg_score <= 0:
+                continue
             products = [effective_lists[cat_i][idx_arrays[cat_i][flat_idx]]
                         for cat_i in range(n_categories)]
-            pkg_score   = float(package_scores[flat_idx])
             total_price = int(price_sum[flat_idx])
             pids    = [p.get("product_id") for p in products]
             penalty = sum(used_pids.get(pid, 0) * DIVERSITY_PENALTY for pid in pids)
@@ -758,8 +762,9 @@ def _ensure_min_products(pkg: dict, global_pool: list, min_count: int) -> dict:
     return out
 
 
-def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked: dict) -> list:
+def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked: dict, budget: int = 0) -> list:
     global_pool = _build_global_product_pool(reranked)
+    budget_cap = budget * 3 if budget > 0 else 0
     adjusted    = []
     seen_sig    = set()
 
@@ -777,11 +782,13 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
         adjusted.append({"theme": theme, "package": fixed_pkg})
 
     if len(adjusted) < MIN_PACKAGES:
-        # 1차: 중복 시그니처 제외하고 채움
         for pkg in all_packages:
             if len(adjusted) >= MIN_PACKAGES:
                 break
             if not isinstance(pkg, dict):
+                continue
+            # 예산 상한 체크
+            if budget_cap > 0 and pkg.get("total_price", 0) > budget_cap:
                 continue
             fixed_pkg = _ensure_min_products(pkg, global_pool, MIN_PRODUCTS_PER_PACKAGE)
             sig       = _package_signature(fixed_pkg)
@@ -792,7 +799,7 @@ def _enforce_minimum_output(themed_packages: list, all_packages: list, reranked:
             adjusted.append({"theme": "밸런스", "package": fixed_pkg})
 
     if len(adjusted) < MIN_PACKAGES:
-        # 2차: 시그니처 중복도 허용하고 채움
+        # 2차: 예산 상한 완화 (부족하면 채움)
         for pkg in all_packages:
             if len(adjusted) >= MIN_PACKAGES:
                 break
@@ -1094,14 +1101,16 @@ def run_scoring(
     if budget > 0:
         max_total = budget * BUDGET_CAP_RATIO
 
-        # 카테고리별 최저 할인가 계산 (구독 총비용이 아닌 실제 판매가 기준)
+        # 카테고리별 추천 예상가 계산 (상위 3개 평균 = 실제 추천될 가격대)
         cat_min_prices = {}
         for cat, df in reranked.items():
             if df.empty:
                 continue
             if "price" in df.columns:
-                min_price = int(df["price"].dropna().min()) if not df["price"].dropna().empty else 0
-                cat_min_prices[cat] = min_price
+                prices = df["price"].dropna().sort_values()
+                top_prices = prices.head(3)
+                est_price = int(top_prices.mean()) if not top_prices.empty else 0
+                cat_min_prices[cat] = est_price
 
         total_min = sum(cat_min_prices.values())
 
@@ -1129,14 +1138,26 @@ def run_scoring(
     # 3. 테마 결정
     themes = _determine_themes(preferences)
 
-    # 3. 멀티 전략 앙상블 + MMR 다양성 선택
+    # 4. 첫 테마로 유효 패키지 존재 여부 확인, 없으면 카테고리 반복 드롭
+    if budget > 0:
+        test_candidates = _get_theme_candidates(reranked, themes[0])
+        test_packages = generate_packages(reranked, budget, candidates=test_candidates, max_packages=5)
+        while not test_packages and len(reranked) > 2:
+            expensive = max(
+                reranked.keys(),
+                key=lambda c: reranked[c]["price"].median()
+                if not reranked[c].empty and "price" in reranked[c].columns else 0,
+            )
+            del reranked[expensive]
+            test_candidates = _get_theme_candidates(reranked, themes[0])
+            test_packages = generate_packages(reranked, budget, candidates=test_candidates, max_packages=5)
+
+    # 5. 멀티 전략 앙상블 + MMR 다양성 선택
     themed_packages = []
 
     for theme in themes:
-        # 테마별 후보 선정 (다른 정렬 기준)
         theme_candidates = _get_theme_candidates(reranked, theme)
 
-        # 테마별 조합 생성 (풀 20개)
         packages = generate_packages(
             reranked, budget,
             candidates=theme_candidates,
@@ -1148,7 +1169,6 @@ def run_scoring(
             pkg["theme_score"] = _score_by_theme(pkg, theme, budget)
         packages.sort(key=lambda p: p["theme_score"], reverse=True)
 
-        # 탐욕적으로 4개 선택
         picked = _mmr_pick_packages(packages, N_PER_THEME, themed_packages)
         for pkg in picked:
             themed_packages.append({"theme": theme, "package": pkg})
@@ -1156,7 +1176,7 @@ def run_scoring(
     # 4. 최소 12개 보장 — 부족하면 밸런스 풀에서 추가
     if len(themed_packages) < MIN_PACKAGES:
         fallback = generate_packages(reranked, budget)
-        themed_packages = _enforce_minimum_output(themed_packages, fallback, reranked)
+        themed_packages = _enforce_minimum_output(themed_packages, fallback, reranked, budget)
 
     # 5. 추천 이유 생성
     if use_llm and themed_packages:
