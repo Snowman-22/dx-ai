@@ -467,13 +467,13 @@ def generate_packages(results: dict, budget: int, candidates: dict = None, max_p
 
     package_scores = 0.8 * avg_scores + 0.2 * budget_fits
 
-    # 패키지 총 할인가가 예산의 4배를 초과하면 점수 대폭 감점 (가능한 한 저가 우선)
+    # 패키지 총 정가가 예산의 3배를 초과하면 선택 불가
     if budget > 0:
-        discount_price_sum = np.zeros(total_combos, dtype=np.int64)
+        original_price_sum = np.zeros(total_combos, dtype=np.int64)
         for cat_i in range(n_categories):
-            cat_dp = np.array([int(float(p.get("price", 0) or 0)) for p in effective_lists[cat_i]])
-            discount_price_sum += cat_dp[idx_arrays[cat_i]]
-        over_cap = discount_price_sum > budget * 3
+            cat_op = np.array([int(float(p.get("original_price", 0) or p.get("price", 0) or 0)) for p in effective_lists[cat_i]])
+            original_price_sum += cat_op[idx_arrays[cat_i]]
+        over_cap = original_price_sum > budget * 3
         package_scores[over_cap] = -1.0  # 3배 초과 시 선택 불가
 
     # ── PID 인덱스 매핑 (numpy 레벨에서 빠른 다양성 체크) ────────
@@ -1102,19 +1102,15 @@ def run_scoring(
     BUDGET_CAP_RATIO = 3
     budget_cap = budget * BUDGET_CAP_RATIO if budget > 0 else 0
 
-    # 카테고리별 최저가 (드롭 판정용) + 후보 예상가 (tight 판정용)
+    # 카테고리별 최저 정가 (드롭/tight 판정용)
     all_cats = list(reranked.keys())
     cat_min = {}
-    cat_est = {}
     for cat, df in reranked.items():
-        if not df.empty and "price" in df.columns:
-            cat_min[cat] = int(df["price"].min())
-            # 후보 상위 3개 평균 = 실제 추천될 가격대
-            top3 = df["price"].dropna().sort_values().head(3)
-            cat_est[cat] = int(top3.mean()) if not top3.empty else 0
-    # 후보 예상가 합이 상한을 넘으면 budget_tight
-    total_est = sum(cat_est.values())
-    budget_tight = budget > 0 and total_est > budget_cap
+        if not df.empty:
+            price_col = "original_price" if "original_price" in df.columns else "price"
+            if price_col in df.columns:
+                cat_min[cat] = int(df[price_col].dropna().min()) if not df[price_col].dropna().empty else 0
+    budget_tight = False
 
     # 3. 테마 결정
     themes = _determine_themes(preferences)
@@ -1144,7 +1140,7 @@ def run_scoring(
     if budget_cap > 0 and themed_packages:
         def _real_price(pkg_item):
             products = pkg_item["package"].get("products", [])
-            return sum(int(float(p.get("price", 0) or 0)) for p in products)
+            return sum(int(float(p.get("original_price", 0) or p.get("price", 0) or 0)) for p in products)
         over_count = sum(1 for pkg in themed_packages if _real_price(pkg) > budget_cap)
         mostly_over = over_count >= len(themed_packages) * 0.8
         if mostly_over:
